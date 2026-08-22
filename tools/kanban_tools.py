@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Optional
 
 from tools.registry import registry, tool_error
@@ -176,43 +177,112 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-def _worker_non_kanban_tool_evidence() -> tuple[str, list[str], list[str]]:
-    """Return current-session non-kanban tool-call evidence for a worker."""
-    from gateway.session_context import get_session_env
-    from hermes_state import SessionDB
+_MATERIAL_KANBAN_TOOLS = frozenset({"kanban_create", "kanban_link"})
 
-    session_id = (
-        os.environ.get("HERMES_SESSION_ID", "").strip()
-        or get_session_env("HERMES_SESSION_ID", "").strip()
+
+def _tool_result_succeeded(result: Any) -> bool:
+    """Conservatively classify a completed tool result as successful."""
+    value = result
+    if value is None:
+        return False
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            text = value.strip()
+            return bool(text) and not text.lower().startswith(("error", "failed:"))
+    if isinstance(value, dict):
+        if value.get("error"):
+            return False
+        if value.get("ok") is False or value.get("success") is False:
+            return False
+        if str(value.get("status") or "").lower() in {
+            "error", "failed", "failure", "cancelled", "canceled", "timeout",
+        }:
+            return False
+        for key in ("exit_code", "returncode"):
+            if key in value and value[key] not in (None, 0, "0"):
+                return False
+    return True
+
+
+def _is_material_tool(tool_name: str) -> bool:
+    name = str(tool_name or "").strip()
+    leaf = name.rsplit(".", 1)[-1]
+    return bool(name) and (
+        not leaf.startswith("kanban_") or leaf in _MATERIAL_KANBAN_TOOLS
     )
-    if not session_id:
-        return "", [], []
 
-    db = SessionDB()
+
+def record_successful_worker_tool(
+    tool_name: str, *, runtime: str = "hermes"
+) -> None:
+    """Persist one successful material-tool receipt for the active run.
+
+    The receipt lives in ``task_events`` rather than process memory. This is
+    deliberate: Codex executes built-in tools in its app-server process and
+    calls ``kanban_complete`` through a separate MCP process. Both processes
+    share the board database but not Python globals. Only the tool name and
+    runtime are stored; arguments and results are intentionally excluded.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    name = str(tool_name or "").strip()
+    if not task_id or not _is_material_tool(name):
+        return
     try:
-        messages = db.get_messages(session_id)
-    finally:
-        db.close()
+        kb, conn = _connect()
+        try:
+            kb.record_task_tool_evidence(
+                conn,
+                task_id,
+                tool_name=name,
+                runtime=runtime,
+                expected_run_id=_worker_run_id(task_id),
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("kanban worker evidence persistence failed", exc_info=True)
 
-    all_tool_calls: list[str] = []
-    non_kanban_calls: list[str] = []
-    for msg in messages:
-        tool_calls = msg.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for call in tool_calls:
-            if not isinstance(call, dict):
-                continue
-            fn = call.get("function")
-            if not isinstance(fn, dict):
-                continue
-            name = str(fn.get("name") or "").strip()
-            if not name:
-                continue
-            all_tool_calls.append(name)
-            if not name.startswith("kanban_"):
-                non_kanban_calls.append(name)
-    return session_id, non_kanban_calls, all_tool_calls
+
+def record_worker_tool_result(tool_name: str, result: Any) -> None:
+    """Record a successful material Hermes tool after real dispatch.
+
+    Called from the real registry-dispatch boundary after a tool returns. A
+    model-emitted call without a result, or a failed result, never counts.
+    Decomposition work performed through ``kanban_create``/``kanban_link`` is
+    material even though those names are Kanban-native.
+    """
+    name = str(tool_name or "").strip()
+    if not _is_material_tool(name) or not _tool_result_succeeded(result):
+        return
+    record_successful_worker_tool(name, runtime="hermes")
+
+
+def _worker_material_tool_evidence(*, wait_seconds: float = 0.0) -> list[str]:
+    """Read current-run evidence, optionally waiting for Codex notification lag.
+
+    Codex can start the MCP ``kanban_complete`` call just before Hermes has
+    consumed the preceding native-tool ``item/completed`` notification. A
+    short bounded wait closes that cross-process ordering race; it never turns
+    a missing receipt into success.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_id = _worker_run_id(task_id) if task_id else None
+    if not task_id or run_id is None:
+        return []
+    kb, conn = _connect()
+    try:
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        while True:
+            evidence = kb.task_tool_evidence(
+                conn, task_id, expected_run_id=run_id
+            )
+            if evidence or time.monotonic() >= deadline:
+                return evidence
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    finally:
+        conn.close()
 
 
 def _ok(**fields: Any) -> str:
@@ -509,46 +579,30 @@ def _handle_complete(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             if os.environ.get("HERMES_KANBAN_TASK") == tid:
-                session_id, non_kanban_calls, all_tool_calls = (
-                    _worker_non_kanban_tool_evidence()
-                )
-                if not non_kanban_calls:
+                material_tools = _worker_material_tool_evidence(wait_seconds=1.0)
+                if not material_tools:
                     reason = (
-                        "worker attempted kanban_complete without any prior "
-                        "non-kanban tool calls in this session"
+                        "worker attempted kanban_complete without a prior "
+                        "successful material tool result in this run"
                     )
-                    detail = (
-                        f" session_id={session_id}."
-                        if session_id else
-                        " session_id unavailable."
-                    )
-                    observed = (
-                        ", ".join(all_tool_calls)
-                        if all_tool_calls else
-                        "(none recorded)"
-                    )
-                    blocked = kb.block_task_for_protocol_violation(
+                    recorded = kb.record_task_protocol_violation(
                         conn, tid,
-                        reason=reason + detail,
+                        reason=reason,
                         expected_run_id=_worker_run_id(tid),
                         details={
-                            "session_id": session_id or None,
-                            "observed_tool_calls": all_tool_calls,
-                            "non_kanban_tool_calls": non_kanban_calls,
+                            "worker_session_id": os.environ.get("HERMES_SESSION_ID") or None,
+                            "material_tool_results": material_tools,
                         },
                     )
-                    if not blocked:
+                    if not recorded:
                         return tool_error(
-                            f"kanban_complete blocked: {reason}{detail} "
-                            f"Observed tool calls: {observed}. Task state "
+                            f"kanban_complete rejected: {reason}. Task state "
                             f"could not be updated because the run is no "
                             f"longer current."
                         )
                     return tool_error(
-                        f"kanban_complete blocked: {reason}{detail} "
-                        f"Observed tool calls: {observed}. The task was "
-                        f"auto-blocked with a protocol_violation event; do "
-                        f"real tool work before retrying."
+                        f"kanban_complete rejected: {reason}. The task remains "
+                        f"in flight; do real tool work, then retry."
                     )
             try:
                 ok = kb.complete_task(

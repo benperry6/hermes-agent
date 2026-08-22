@@ -256,6 +256,34 @@ class TestRunTurn:
         # Each tool item produces (assistant, tool) — 2*2 + final assistant = 5 msgs
         assert len(r.projected_messages) == 5
 
+    def test_successful_native_tool_records_kanban_evidence(self, monkeypatch):
+        """Codex built-ins bypass model_tools; the session seam must record."""
+        recorded = []
+        monkeypatch.setattr(
+            "tools.kanban_tools.record_successful_worker_tool",
+            lambda name, *, runtime: recorded.append((name, runtime)),
+        )
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex-evidence",
+                "command": "echo ok", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "ok",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn("do work", turn_timeout=2.0)
+
+        assert result.error is None
+        assert recorded == [("exec_command", "codex_app_server")]
+
     def test_turn_start_failure_returns_error(self):
         client = FakeClient()
         from agent.transports.codex_app_server import CodexAppServerError

@@ -80,6 +80,24 @@ class TurnResult:
     should_retire: bool = False
 
 
+def _record_kanban_projection_evidence(projection: Any) -> None:
+    """Persist successful Codex-native work for a dispatcher-owned run.
+
+    Codex's shell and patch tools never cross ``model_tools``. The projector
+    is therefore the first trusted Hermes boundary that sees their completed
+    status. The recorder is a no-op outside a Kanban worker process.
+    """
+    tool_name = getattr(projection, "material_tool_name", None)
+    if not tool_name:
+        return
+    try:
+        from tools.kanban_tools import record_successful_worker_tool
+
+        record_successful_worker_tool(tool_name, runtime="codex_app_server")
+    except Exception:
+        logger.debug("codex kanban evidence recording failed", exc_info=True)
+
+
 # Markers we accept as terminal even when codex never emits turn/completed.
 # Some codex versions stream `<turn_aborted>` as raw text in agentMessage
 # items when an interrupt or upstream error tears the turn down before the
@@ -502,6 +520,7 @@ class CodexAppServerSession:
                         break
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
+                    _record_kanban_projection_evidence(proj)
                     if proj.messages:
                         result.projected_messages.extend(proj.messages)
                     if proj.is_tool_iteration:
@@ -543,6 +562,7 @@ class CodexAppServerSession:
 
             # Project into messages
             projection = projector.project(note)
+            _record_kanban_projection_evidence(projection)
             if projection.messages:
                 result.projected_messages.extend(projection.messages)
             if projection.is_tool_iteration:

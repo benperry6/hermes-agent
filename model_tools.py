@@ -846,6 +846,16 @@ def handle_function_call(
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
+        # Kanban completion integrity (#32746): record only a tool that
+        # actually returned from the real dispatch boundary. The recorder is
+        # a no-op outside dispatcher-owned worker processes.
+        try:
+            from tools.kanban_tools import record_worker_tool_result
+
+            record_worker_tool_result(function_name, result)
+        except Exception:
+            logger.debug("kanban worker evidence recording failed", exc_info=True)
+
         try:
             from hermes_cli.plugins import invoke_hook
             invoke_hook(

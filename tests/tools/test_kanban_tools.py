@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 
 import pytest
 
@@ -35,6 +37,24 @@ def _seed_worker_session(session_id: str, tool_names: list[str]) -> None:
         )
     finally:
         db.close()
+    # Mirror the live post-dispatch recorder for unit tests that seed a
+    # completed worker transcript directly instead of invoking model_tools.
+    from tools import kanban_tools as kt
+    for name in tool_names:
+        kt.record_worker_tool_result(name, json.dumps({"ok": True}))
+
+
+def _clear_worker_tool_evidence(task_id: str) -> None:
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = 'tool_evidence'",
+            (task_id,),
+        )
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +208,12 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
     session_id = "sess-worker-default"
     monkeypatch.setenv("HERMES_SESSION_ID", session_id)
     _seed_worker_session(session_id, ["read_file"])
@@ -529,30 +552,144 @@ def test_complete_rejects_non_dict_metadata(worker_env):
     assert json.loads(out).get("error")
 
 
-def test_complete_auto_blocks_without_non_kanban_tool_evidence(worker_env, monkeypatch):
+def test_complete_rejects_without_successful_material_tool_evidence(worker_env, monkeypatch):
     from hermes_cli import kanban_db as kb
-    from hermes_state import SessionDB
     from tools import kanban_tools as kt
 
     session_id = "sess-kanban-only"
     monkeypatch.setenv("HERMES_SESSION_ID", session_id)
-    _seed_worker_session(session_id, ["kanban_show", "kanban_complete"])
+    _clear_worker_tool_evidence(worker_env)
 
     out = json.loads(kt._handle_complete({"summary": "fabricated completion"}))
     err = out.get("error", "")
-    assert "non-kanban tool calls" in err
-    assert "protocol_violation" in err
+    assert "successful material tool result" in err
+    assert "remains in flight" in err
 
     conn = kb.connect()
     try:
         task = kb.get_task(conn, worker_env)
-        assert task.status == "blocked"
+        assert task.status == "running"
         events = kb.list_events(conn, worker_env)
         kinds = [e.kind for e in events]
         assert "protocol_violation" in kinds
-        assert "blocked" in kinds
+        assert "blocked" not in kinds
     finally:
         conn.close()
+
+
+def test_complete_accepts_successful_non_kanban_result(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-success")
+    kt.record_worker_tool_result("read_file", json.dumps({"ok": True, "text": "data"}))
+
+    out = json.loads(kt._handle_complete({"summary": "verified work"}))
+    assert out.get("ok") is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "done"
+        evidence = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "tool_evidence"
+        ]
+        assert len(evidence) == 1
+        assert evidence[0].payload == {"tool": "read_file", "runtime": "hermes"}
+    finally:
+        conn.close()
+
+
+def test_complete_waits_for_cross_process_codex_receipt(worker_env):
+    from tools import kanban_tools as kt
+
+    _clear_worker_tool_evidence(worker_env)
+
+    def delayed_receipt():
+        time.sleep(0.1)
+        kt.record_successful_worker_tool(
+            "exec_command", runtime="codex_app_server"
+        )
+
+    writer = threading.Thread(target=delayed_receipt)
+    writer.start()
+    try:
+        out = json.loads(kt._handle_complete({"summary": "codex work done"}))
+    finally:
+        writer.join(timeout=2)
+
+    assert not writer.is_alive()
+    assert out.get("ok") is True
+
+
+def test_failed_tool_result_does_not_count_as_evidence(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-failed")
+    _clear_worker_tool_evidence(worker_env)
+    kt.record_worker_tool_result("read_file", json.dumps({"error": "missing"}))
+
+    out = json.loads(kt._handle_complete({"summary": "not actually done"}))
+    assert "successful material tool result" in out.get("error", "")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "failed_result",
+    [
+        None,
+        "Error: permission denied",
+        json.dumps({"status": "cancelled"}),
+        json.dumps({"exit_code": 1, "stdout": ""}),
+        json.dumps({"success": False}),
+    ],
+)
+def test_failure_result_shapes_never_count(worker_env, monkeypatch, failed_result):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-failure-shapes")
+    _clear_worker_tool_evidence(worker_env)
+    kt.record_worker_tool_result("terminal", failed_result)
+    assert kt._worker_material_tool_evidence() == []
+
+
+def test_successful_decomposition_counts_as_material_evidence(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-decompose")
+    kt.record_worker_tool_result("kanban_create", json.dumps({"ok": True, "task_id": "t_child"}))
+
+    out = json.loads(kt._handle_complete({"summary": "decomposed into child work"}))
+    assert out.get("ok") is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "done"
+    finally:
+        conn.close()
+
+
+def test_real_dispatch_boundary_records_successful_result(worker_env, monkeypatch):
+    """The production model_tools seam, not a seeded DB transcript, owns evidence."""
+    import model_tools
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-real-dispatch")
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda *args, **kwargs: json.dumps({"ok": True, "text": "live"}),
+    )
+
+    model_tools.handle_function_call(
+        "read_file", {"path": "/tmp/evidence"}, skip_pre_tool_call_hook=True,
+    )
+
+    assert kt._worker_material_tool_evidence() == ["read_file"]
 
 
 def test_complete_phantom_card_message_advertises_retry(worker_env):
@@ -1421,6 +1558,7 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run2.id))
+    _seed_worker_session("session-stale-run", ["read_file"])
     out = kt._handle_complete({"summary": "current completion"})
     d = json.loads(out)
     assert d.get("ok") is True
