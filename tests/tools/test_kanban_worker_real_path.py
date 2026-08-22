@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import concurrent.futures
+import contextvars
 
 import pytest
 
@@ -372,6 +374,82 @@ class TestRealWorkerExecuteCodeGate:
 
         assert result["approved"] is False
         _assert_no_human_surface_touched(human_surfaces)
+
+
+# ---------------------------------------------------------------------------
+# Mixed in-process cron/kanban policy: the active execution context wins
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("kanban_mode", "cron_mode", "expected_approved", "expected_policy"),
+    [
+        ("approve", "deny", False, "cron_mode"),
+        ("deny", "approve", True, None),
+    ],
+)
+def test_in_process_cron_policy_crosses_scheduler_thread_boundary(
+    kanban_mode, cron_mode, expected_approved, expected_policy,
+    monkeypatch, tmp_path, human_surfaces,
+):
+    """A cron job launched inside a worker must not inherit kanban_mode.
+
+    The process-wide worker marker legitimately remains set while the cron
+    agent runs under ``non_dispatcher_owned_context``.  The context-local cron
+    policy must win at every approval entry point.
+    """
+    from agent.delegation_context import (
+        enter_non_dispatcher_owned_context,
+        exit_non_dispatcher_owned_context,
+    )
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    env = _spawn_worker_env(monkeypatch, tmp_path, {})
+    _enter_worker_process(monkeypatch, env)
+    monkeypatch.setattr(approval_module, "_get_kanban_approval_mode", lambda: kanban_mode)
+    monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: cron_mode)
+
+    gates = (
+        lambda: check_dangerous_command(DANGEROUS_CMD, "local"),
+        lambda: check_all_command_guards(DANGEROUS_CMD, "local"),
+        lambda: request_tool_approval("write_file", "writes to ~/.ssh"),
+        lambda: check_execute_code_guard("import os", "local"),
+    )
+    session_tokens = set_session_vars(cron_session="1")
+    owner_token = enter_non_dispatcher_owned_context()
+    try:
+        # Mirrors scheduler.tick: capture the cron-owned context, then execute
+        # it inside the scheduler's ThreadPoolExecutor worker.
+        cron_context = contextvars.copy_context()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            results = pool.submit(
+                cron_context.run, lambda: [gate() for gate in gates]
+            ).result(timeout=5)
+    finally:
+        exit_non_dispatcher_owned_context(owner_token)
+        clear_session_vars(session_tokens)
+
+    assert all(result["approved"] is expected_approved for result in results)
+    if expected_policy:
+        assert all(expected_policy in (result.get("message") or "") for result in results)
+    _assert_no_human_surface_touched(human_surfaces)
+
+
+def test_delegated_child_keeps_parent_worker_approval_policy(
+    monkeypatch, tmp_path, human_surfaces
+):
+    """A worker's delegate is still part of the unattended worker operation."""
+    from agent.delegation_context import delegated_child_context
+
+    env = _spawn_worker_env(monkeypatch, tmp_path, {})
+    _enter_worker_process(monkeypatch, env)
+    monkeypatch.setattr(approval_module, "_get_kanban_approval_mode", lambda: "deny")
+
+    with delegated_child_context("child-session"):
+        result = request_tool_approval("write_file", "writes to ~/.ssh")
+
+    assert result["approved"] is False
+    assert "kanban_mode" in (result.get("message") or "")
+    _assert_no_human_surface_touched(human_surfaces)
 
 
 # ---------------------------------------------------------------------------
