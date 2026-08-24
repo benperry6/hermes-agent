@@ -52,6 +52,32 @@ def _format_tool_args(d: dict) -> str:
     return json.dumps(d, ensure_ascii=False, sort_keys=True)
 
 
+def _tool_payload_failed(value: Any) -> bool:
+    """Detect transport-successful payloads that encode a tool failure."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return False
+        try:
+            return _tool_payload_failed(json.loads(text))
+        except (TypeError, ValueError):
+            return text.lower().startswith(("error", "failed:"))
+    if isinstance(value, list):
+        return any(_tool_payload_failed(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    if value.get("isError") is True or value.get("error"):
+        return True
+    if value.get("ok") is False or value.get("success") is False:
+        return True
+    if str(value.get("status") or "").lower() in {
+        "error", "failed", "failure", "cancelled", "canceled", "timeout",
+    }:
+        return True
+    return _tool_payload_failed(value.get("structuredContent")) or \
+        _tool_payload_failed(value.get("content"))
+
+
 @dataclass
 class ProjectionResult:
     """Output of projecting one Codex item.
@@ -64,6 +90,8 @@ class ProjectionResult:
     messages: list[dict] = field(default_factory=list)
     is_tool_iteration: bool = False
     final_text: Optional[str] = None  # Set when an agentMessage completes
+    # Metadata-only proof: never contains args, result, path, or output.
+    material_tool_name: Optional[str] = None
 
 
 class CodexEventProjector:
@@ -172,7 +200,13 @@ class CodexEventProjector:
             "content": output,
         }
         return ProjectionResult(
-            messages=[assistant_msg, tool_msg], is_tool_iteration=True
+            messages=[assistant_msg, tool_msg],
+            is_tool_iteration=True,
+            material_tool_name=(
+                "exec_command"
+                if item.get("status") == "completed" and exit_code == 0
+                else None
+            ),
         )
 
     def _project_file_change(self, item: dict, item_id: str) -> ProjectionResult:
@@ -211,7 +245,14 @@ class CodexEventProjector:
             "content": f"apply_patch status={status}, {n} change(s)",
         }
         return ProjectionResult(
-            messages=[assistant_msg, tool_msg], is_tool_iteration=True
+            messages=[assistant_msg, tool_msg],
+            is_tool_iteration=True,
+            material_tool_name=(
+                "apply_patch"
+                if changes_summary
+                and str(status).lower() in {"applied", "completed", "success"}
+                else None
+            ),
         )
 
     def _project_mcp_tool_call(self, item: dict, item_id: str) -> ProjectionResult:
@@ -254,7 +295,16 @@ class CodexEventProjector:
             "content": content,
         }
         return ProjectionResult(
-            messages=[assistant_msg, tool_msg], is_tool_iteration=True
+            messages=[assistant_msg, tool_msg],
+            is_tool_iteration=True,
+            material_tool_name=(
+                f"mcp.{server}.{tool}"
+                if error is None
+                and result is not None
+                and item.get("status") == "completed"
+                and not _tool_payload_failed(result)
+                else None
+            ),
         )
 
     def _project_dynamic_tool_call(
@@ -294,7 +344,13 @@ class CodexEventProjector:
             "content": content,
         }
         return ProjectionResult(
-            messages=[assistant_msg, tool_msg], is_tool_iteration=True
+            messages=[assistant_msg, tool_msg],
+            is_tool_iteration=True,
+            material_tool_name=(
+                tool
+                if item.get("status") == "completed" and item.get("success") is True
+                else None
+            ),
         )
 
     def _project_opaque(self, item: dict, item_type: str) -> ProjectionResult:

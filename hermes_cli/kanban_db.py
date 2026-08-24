@@ -6768,6 +6768,106 @@ def request_changes(
     return True, implementer
 
 
+def record_task_protocol_violation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    expected_run_id: Optional[int] = None,
+    details: Optional[dict] = None,
+) -> bool:
+    """Audit a rejected worker transition without ending the current run."""
+    payload = {"reason": reason}
+    if isinstance(details, dict) and details:
+        payload.update(details)
+    with write_txn(conn):
+        if expected_run_id is None:
+            row = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ? "
+                "AND status IN ('running', 'ready')",
+                (task_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ? "
+                "AND status IN ('running', 'ready') AND current_run_id = ?",
+                (task_id, int(expected_run_id)),
+            ).fetchone()
+        if row is None:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "protocol_violation",
+            payload,
+            run_id=row["current_run_id"],
+        )
+        return True
+
+
+def record_task_tool_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    tool_name: str,
+    runtime: str,
+    expected_run_id: Optional[int],
+) -> bool:
+    """Persist one metadata-only material-tool receipt for the current run."""
+    name = str(tool_name or "").strip()
+    if not name or expected_run_id is None:
+        return False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? "
+            "AND status IN ('running', 'ready') AND current_run_id = ?",
+            (task_id, int(expected_run_id)),
+        ).fetchone()
+        if row is None:
+            return False
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'tool_evidence' LIMIT 1",
+            (task_id, int(expected_run_id)),
+        ).fetchone()
+        if existing is not None:
+            return True
+        _append_event(
+            conn,
+            task_id,
+            "tool_evidence",
+            {"tool": name, "runtime": str(runtime or "unknown")},
+            run_id=int(expected_run_id),
+        )
+        return True
+
+
+def task_tool_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+) -> list[str]:
+    """Return material tool names recorded for exactly one current run."""
+    if expected_run_id is None:
+        return []
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'tool_evidence' ORDER BY id ASC",
+        (task_id, int(expected_run_id)),
+    ).fetchall()
+    names: list[str] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        name = str(payload.get("tool") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,

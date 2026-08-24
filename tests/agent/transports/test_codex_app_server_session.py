@@ -309,6 +309,39 @@ class TestRunTurn:
         # Each tool item produces (assistant, tool) — 2*2 + final assistant = 5 msgs
         assert len(r.projected_messages) == 5
 
+    def test_successful_projected_tool_is_recorded_after_scope_filter(
+        self, monkeypatch,
+    ):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "evidence",
+                "command": "pwd", "cwd": "/tmp", "status": "completed",
+                "aggregatedOutput": "/tmp", "exitCode": 0,
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed"},
+        )
+        recorded = []
+
+        def capture_material(projection):
+            if projection.material_tool_name:
+                recorded.append(projection.material_tool_name)
+
+        monkeypatch.setattr(
+            session_mod,
+            "_record_kanban_projection_evidence",
+            capture_material,
+        )
+
+        make_session(client).run_turn(user_input="work")
+
+        assert recorded == ["exec_command"]
+
 
     def test_turn_start_failure_attaches_redacted_stderr_tail(self):
         """When codex stderr has content (non-OAuth), the tail gets attached
