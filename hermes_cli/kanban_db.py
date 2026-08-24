@@ -10938,6 +10938,12 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    # The dispatcher process may itself run with --yolo.  A worker has its own
+    # profile-local approvals.single_query_mode because it is launched through
+    # chat -q; do not freeze the dispatcher's process-wide bypass into the child
+    # before that native policy can run.
+    env.pop("HERMES_YOLO_MODE", None)
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
