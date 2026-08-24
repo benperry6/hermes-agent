@@ -24,6 +24,8 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban import run_slash
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -279,7 +281,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             )
             # Spawn by hand: claim + set pid + set active run start to the past.
             kb.claim_task(conn, tid)
-            kb._set_worker_pid(conn, tid, os.getpid())   # any live pid works
+            kb._set_worker_pid(conn, tid, 12345)
             # Backdate both the task-level first-start timestamp and the active
             # run timestamp so elapsed > limit under the per-run runtime model.
             old_started = int(time.time()) - 30
@@ -294,9 +296,10 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
                     (old_started, tid),
                 )
 
+            _kb.verify_worker_identity = lambda *_args: (True, "exact_match")
             timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
             assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
+            assert killed and killed[0][0] == 12345
 
             task = kb.get_task(conn, tid)
             assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
@@ -491,11 +494,15 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
             task = kb.get_task(conn2, tid)
             assert task.current_run_id == runs[0].id
 
-            # Subsequent complete closes the backfilled run cleanly.
-            kb.complete_task(conn2, tid, result="done", summary="ok")
+            # The migration does not invent Linux birth identity for the legacy
+            # run. A terminal transition therefore fails closed until an
+            # operator resolves the old authority explicitly.
+            assert kb.complete_task(
+                conn2, tid, result="done", summary="ok"
+            ) is False
             r = kb.latest_run(conn2, tid)
-            assert r.outcome == "completed"
-            assert r.summary == "ok"
+            assert r.outcome is None
+            assert r.status == "running"
         finally:
             conn2.close()
     finally:
@@ -528,36 +535,38 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
 
 
 
-def test_claim_task_recovers_from_invariant_leak(kanban_home):
-    """Belt-and-suspenders: if a prior run somehow leaked (stranded
-    current_run_id on a ready task), claim_task should recover rather
-    than strand it further."""
+def test_claim_task_refuses_invariant_leak_without_mutation(kanban_home):
+    """A leaked current run blocks re-claim until exact recovery resolves it."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="invariant test", assignee="worker")
-        # Manually engineer the invariant violation: create a run, then
-        # flip status back to 'ready' without closing the run.
         kb.claim_task(conn, tid)
         leaked_run_id = kb.latest_run(conn, tid).id
         conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-            "claim_expires = NULL "
-            "WHERE id = ?", (tid,),
+            "claim_expires = NULL WHERE id = ?", (tid,),
         )
         conn.commit()
-        # The leaked run is still open.
-        assert kb.get_run(conn, leaked_run_id).ended_at is None
+        task_before = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        run_before = kb.get_run(conn, leaked_run_id)
+        assert run_before is not None and run_before.ended_at is None
 
-        # Now re-claim — the defensive recovery must close the leak.
-        claimed = kb.claim_task(conn, tid)
-        assert claimed is not None
-        leaked = kb.get_run(conn, leaked_run_id)
-        assert leaked.ended_at is not None
-        assert leaked.outcome == "reclaimed"
-        # New run opened and pointed to.
-        new_run = kb.latest_run(conn, tid)
-        assert new_run.id != leaked_run_id
-        assert new_run.ended_at is None
+        assert kb.claim_task(conn, tid) is None
+
+        task_after = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        run_after = kb.get_run(conn, leaked_run_id)
+        assert tuple(task_after) == tuple(task_before)
+        assert run_after is not None
+        assert (run_after.status, run_after.outcome, run_after.ended_at) == (
+            run_before.status, run_before.outcome, run_before.ended_at,
+        )
+        assert len(kb.list_runs(conn, tid)) == 1
     finally:
         conn.close()
 
@@ -593,7 +602,11 @@ def test_unblock_invariant_recovery(kanban_home):
         assert kb.get_task(conn, tid).current_run_id == leaked_run_id
         assert kb.get_run(conn, leaked_run_id).ended_at is None
 
-        # Unblock — the defensive recovery must close the leaked run.
+        # Unblock cannot bypass the inherited worker fence. Once the synthetic
+        # worker scope is proven quiescent, the normal dangling-run recovery
+        # closes the run and unblocks the card.
+        assert kb.unblock_task(conn, tid) is False
+        assert kb._release_quiesced_worker_fences(conn) == [tid]
         assert kb.unblock_task(conn, tid) is True
         task = kb.get_task(conn, tid)
         assert task.status == "ready"
@@ -649,6 +662,7 @@ def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch):
 # Battle-test findings (May 2026: stress/ suite exposed zombie + id collision)
 # -------------------------------------------------------------------------
 
+@pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif("linux" not in __import__("sys").platform,
                     reason="zombie detection is Linux-specific")
 def test_pid_alive_detects_zombie(kanban_home):
@@ -1202,7 +1216,6 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
     """Manual reclaim releases the claim, resets status, and emits a
     ``reclaimed`` event even when claim_expires has not passed."""
     import signal
-    import time
     import secrets
     import hermes_cli.kanban_db as _kb
     conn = kb.connect()
@@ -1210,7 +1223,6 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         t = kb.create_task(conn, title="stuck", assignee="broken")
         # Simulate a live claim (not expired).
         lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
-        future = int(time.time()) + 3600
         killed: list[int] = []
         state = {"alive": True}
 
@@ -1220,19 +1232,14 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
                 state["alive"] = False
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
-        conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, future, 12345, t),
+        monkeypatch.setattr(
+            _kb,
+            "verify_worker_identity",
+            lambda _pid, _identity: (True, "exact_match"),
         )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 12345, int(time.time())),
-        )
-        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
-        conn.commit()
+        claimed = kb.claim_task(conn, t, claimer=lock, ttl_seconds=3600)
+        assert claimed is not None
+        kb._set_worker_pid(conn, t, 12345)
 
         # release_stale_claims should NOT reclaim (not expired).
         assert kb.release_stale_claims(conn) == 0

@@ -310,6 +310,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_WORKSPACES_ROOT",
     "HERMES_KANBAN_LOGS_ROOT",
     "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_WORKER_LAUNCH",
     "HERMES_KANBAN_WORKSPACE",
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
@@ -1393,7 +1394,7 @@ def _live_system_guard(request, monkeypatch):
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
-                f"os.killpg({pgid}, {sig}) — PGID is outside the test "
+                f"os.killpg({pgid}, {sig}) — PGID is outside the test "  # windows-footgun: ok — diagnostic text
                 "process group. See _live_system_guard for the why."
             )
 
@@ -1743,3 +1744,79 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture
+def synthetic_kanban_worker_lifecycle(monkeypatch):
+    """Model a spawned Linux worker that exits immediately after each handoff.
+
+    Legacy lifecycle tests call ``claim_task`` directly and therefore skip the
+    real dispatcher's PID/identity boundary. Opt-in files use this fixture to
+    supply that boundary; Linux fence behavior itself is tested without this
+    fixture in ``test_kanban_linux_worker_authority.py``.
+    """
+    import itertools
+
+    from hermes_cli import kanban_db as kb
+
+    pids = itertools.count(900_000)
+
+    def _identity(pid):
+        return {
+            "v": kb.WORKER_IDENTITY_VERSION,
+            "scheme": "linux_proc",
+            "pid": int(pid),
+            "boot_id": "synthetic-test-boot",
+            "pid_namespace": "pid:[synthetic-test]",
+            "starttime": int(pid),
+            "pgid": int(pid),
+        }
+
+    monkeypatch.setattr(kb, "capture_worker_identity", _identity)
+    monkeypatch.setattr(kb, "_worker_scope_is_quiescent", lambda *_args: True)
+    def _verify_synthetic(pid, stored):
+        identity = kb._coerce_worker_identity(stored)
+        try:
+            if identity and int(identity["pid"]) == int(pid):
+                return False, "process_absent"
+        except (KeyError, TypeError, ValueError):
+            pass
+        return False, "identity_unavailable"
+
+    monkeypatch.setattr(kb, "verify_worker_identity", _verify_synthetic)
+
+    real_claim_task = kb.claim_task
+    real_claim_review_task = kb.claim_review_task
+
+    def _stamp_claim(conn, task_id, result):
+        if result is not None:
+            kb._set_worker_pid(conn, task_id, next(pids))
+        return result
+
+    def _claim_task(conn, task_id, *args, **kwargs):
+        return _stamp_claim(
+            conn, task_id, real_claim_task(conn, task_id, *args, **kwargs)
+        )
+
+    def _claim_review_task(conn, task_id, *args, **kwargs):
+        return _stamp_claim(
+            conn, task_id, real_claim_review_task(conn, task_id, *args, **kwargs)
+        )
+
+    monkeypatch.setattr(kb, "claim_task", _claim_task)
+    monkeypatch.setattr(kb, "claim_review_task", _claim_review_task)
+
+    def _wrap_handoff(name):
+        real = getattr(kb, name)
+
+        def _wrapped(conn, task_id, *args, **kwargs):
+            result = real(conn, task_id, *args, **kwargs)
+            ok = result[0] if isinstance(result, tuple) else bool(result)
+            if ok:
+                kb._release_quiesced_worker_fences(conn)
+            return result
+
+        monkeypatch.setattr(kb, name, _wrapped)
+
+    for name in ("request_review", "request_changes", "block_task", "complete_task"):
+        _wrap_handoff(name)

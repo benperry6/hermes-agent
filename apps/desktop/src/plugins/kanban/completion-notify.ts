@@ -8,7 +8,9 @@
  * mark. Notifies on the same terminal kinds the gateway watcher pings
  * (gateway/kanban_watchers.py): 'completed' (kanban_db.complete_task —
  * payload: summary + artifacts), 'blocked' (payload: reason), 'gave_up'
- * (payload: error), 'crashed', 'timed_out', and 'block_loop_detected'
+ * (payload: error), 'crashed', 'timed_out', 'no_progress_deferred' (the
+ * worker is alive but its progress lease expired; the dispatcher holds the
+ * claim and the task keeps running), and 'block_loop_detected'
  * (payload: reason — the routed-to-triage human handoff).
  *
  * Two delivery doors, complementary by design:
@@ -51,6 +53,7 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
   ['completed', { titleKey: 'notify.completedTitle', toast: 'success' }],
   ['crashed', { titleKey: 'notify.crashedTitle', toast: 'error' }],
   ['gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'error' }],
+  ['no_progress_deferred', { titleKey: 'notify.noProgressDeferredTitle', toast: 'warning' }],
   ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
 ])
 

@@ -535,6 +535,32 @@ def _managed_values(
 _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S = 30.0
 
 
+def _note_verified_tool_progress(
+    tool_name: str | None, result: Any, tool_args: dict[str, Any],
+) -> None:
+    """Record a VERIFIED tool execution as progress on the kanban board.
+
+    Separate from ``agent._touch_activity``, the LIVENESS clock: that one is
+    stamped by stream chunks, API waits and the in-flight ticker above, so a
+    worker reasoning in a loop keeps it fresh forever. Progress is stamped
+    exactly once per tool call, after the call returned, with its observed
+    result — the bridge itself refuses refused/failed/read-only/bookkeeping
+    calls, so "a tool was attempted" never counts and the in-flight ticker
+    deliberately does not feed it.
+
+    Gated on the dispatcher-spawned-worker env var before importing anything,
+    so a normal chat session pays nothing. Best-effort: a bridge failure must
+    never break the agent loop.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    try:
+        from tools.kanban_tools import note_tool_progress_from_env
+        note_tool_progress_from_env(tool_name, result, tool_args=tool_args)
+    except Exception:
+        pass
+
+
 def _run_tool_activity_heartbeat(
     agent,
     stop_event: threading.Event,
@@ -723,10 +749,16 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            result = execute(final_args)
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
+        # Kanban progress lease: every tool — sequential and concurrent —
+        # funnels through this middleware, and only here is the call known
+        # to have been dispatched (not refused) with an observed result. A
+        # raised tool never reaches this line.
+        _note_verified_tool_progress(function_name, result, final_args)
+        return result
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(

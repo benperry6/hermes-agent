@@ -262,6 +262,34 @@ class TestFormatKanbanEventText:
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
 
+    def test_no_progress_deferred_is_a_claimed_kind_that_renders(self):
+        """A deferred progress-lease receipt must reach the TUI subscriber —
+        and say truthfully that the claim is held, not that the task was
+        reclaimed or the worker terminated."""
+        from tui_gateway import server as _server
+
+        assert "no_progress_deferred" in _server._KANBAN_NOTIFY_KINDS
+        assert "no_progress_deferred" not in _server._KANBAN_SILENT_KINDS
+        ev = SimpleNamespace(
+            kind="no_progress_deferred",
+            payload={"progress_age_seconds": 3000, "timeout_seconds": 2700},
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+        assert "t_abc123" in text
+        assert "no observable progress" in text
+        assert "3000s" in text and "2700s" in text
+        assert "claim held" in text
+        assert "[main]" in text and "@worker" in text
+        for untrue in ("terminated", "requeue", "will retry", "reclaimed"):
+            assert untrue not in text, untrue
+
+    def test_no_progress_deferred_with_bad_payload_does_not_raise(self):
+        ev = SimpleNamespace(kind="no_progress_deferred", payload={"progress_age_seconds": "x"})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "no observable progress" in text
+        ev = SimpleNamespace(kind="no_progress_deferred", payload=None)
+        assert "no observable progress" in _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+
 
 class TestNotificationPollerLoopKanbanWiring:
     """Drive a real TUI subscription through ``_notification_poller_loop``.

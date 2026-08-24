@@ -2741,6 +2741,31 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # No-progress detection (progress lease). A running task whose
+        # worker is alive — streaming, reasoning, heartbeating — but has
+        # produced NO observable progress for this many seconds is reported:
+        # the dispatcher records a durable ``no_progress_deferred`` event
+        # and holds the claim. It does not terminate the worker, requeue
+        # the task or count a failure — the card keeps running and the
+        # existing crash / stale / max-runtime paths and manual reclaim
+        # remain the recovery levers.
+        #
+        # "Progress" is deterministic, never something the model asserts
+        # about itself: a verified tool execution (dispatched, able to
+        # change the task's world, and successful — seen by the tool
+        # middleware), a durable board transition, or the claim itself.
+        # Raw stream tokens, API waits and `kanban_heartbeat` — whatever
+        # its note says — renew LIVENESS (`last_heartbeat_at`) but never
+        # progress, so a slow single model call is untouched while a
+        # reasoning-only loop is bounded.
+        #
+        # Default 45 min: wider than any plausible single model call
+        # (extended thinking and provider backoff included). Set 0 to
+        # disable. Values in 1..59, booleans and unparseable values are
+        # refused (a WARNING is logged and the default is used): a
+        # sub-minute progress bound would flag healthy workers, so it is a
+        # units slip rather than an intent.
+        "no_progress_timeout_seconds": 2700,
         # Orphaned-card reconciliation: each dispatcher tick, requeue
         # 'running' cards whose claim bookkeeping is broken (claim_lock or
         # claim_expires NULL with a dead/gone worker) — zombies invisible

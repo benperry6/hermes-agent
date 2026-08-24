@@ -1078,6 +1078,76 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_no_progress_deferred(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """The dispatcher reported this running attempt's PROGRESS lease as
+    expired (``no_progress_deferred``): the worker was alive — streaming,
+    reasoning, heartbeating — but produced no verified tool execution and
+    no board transition for ``kanban.no_progress_timeout_seconds``. The
+    dispatcher holds the claim and does nothing else, so without this
+    surface the card simply looks busy.
+
+    Scoped to the CURRENT attempt: receipts for a previous run (a retried
+    card) are history, and a receipt that predates the attempt's latest
+    progress (``tasks.last_progress_at``) has been superseded by real work.
+    """
+    if _task_field(task, "status") != "running":
+        return []
+    run_id = _task_field(task, "current_run_id")
+    if run_id is None:
+        return []
+    receipts = [
+        ev for ev in events
+        if _event_kind(ev) == "no_progress_deferred"
+        and _task_field(ev, "run_id") == run_id
+    ]
+    if not receipts:
+        return []
+    latest = receipts[-1]
+    last_progress = _task_field(task, "last_progress_at")
+    if last_progress is not None and int(last_progress) >= _event_ts(latest):
+        return []
+    payload = _parse_payload(latest)
+    age = _positive_int(payload.get("progress_age_seconds"), 0)
+    limit = _positive_int(payload.get("timeout_seconds"), 0)
+    liveness = str(payload.get("liveness") or "unknown")
+    task_id = _task_field(task, "id")
+    actions: list[DiagnosticAction] = []
+    if task_id:
+        actions.append(DiagnosticAction(
+            kind="cli_hint",
+            label=f"Check logs: hermes kanban log {task_id}",
+            payload={"command": f"hermes kanban log {task_id}"},
+            suggested=True,
+        ))
+    actions.extend(_generic_recovery_actions(task, running=True))
+    return [Diagnostic(
+        kind="no_progress_deferred",
+        severity="warning",
+        title=(
+            f"No observable progress for {age}s (limit {limit}s) — claim held"
+        ),
+        detail=(
+            f"The worker's liveness heartbeat is {liveness}, but no verified "
+            f"tool execution and no board transition has renewed its progress "
+            f"lease within kanban.no_progress_timeout_seconds ({limit}s). The "
+            f"dispatcher recorded the condition and is holding the claim; it "
+            f"has not terminated or requeued the worker. Check the worker log "
+            f"for a reasoning loop, steer it with a comment, or reclaim it."
+        ),
+        actions=actions,
+        first_seen_at=_event_ts(receipts[0]),
+        last_seen_at=_event_ts(latest),
+        count=len(receipts),
+        run_id=int(run_id),
+        data={
+            "progress_age_seconds": age,
+            "timeout_seconds": limit,
+            "liveness": liveness,
+            "receipts": len(receipts),
+        },
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -1090,6 +1160,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_no_progress_deferred,
 ]
 
 
@@ -1105,6 +1176,7 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "no_progress_deferred",
 )
 
 

@@ -21,6 +21,8 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -310,7 +312,7 @@ def test_reopening_parent_demotes_ready_child(client):
     assert child_after_reopen["status"] == "todo"
 
 
-def test_reopening_parent_retracts_review_and_blocks_approval(client):
+def test_reopening_parent_is_blocked_while_review_group_is_active(client):
     with kb.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")
         assert kb.complete_task(conn, parent_id)
@@ -341,45 +343,19 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         f"/api/plugins/kanban/tasks/{parent_id}",
         json={"status": "ready"},
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 409, response.text
 
     with kb.connect() as conn:
+        parent = kb.get_task(conn, parent_id)
         child = kb.get_task(conn, child_id)
-        assert child is not None
-        assert child.status == "todo"
-        reclaimed = kb.latest_run(conn, child_id)
-        assert reclaimed is not None
-        assert reclaimed.outcome == "reclaimed"
-        assert kb.claim_review_task(conn, child_id) is None
-        assert not kb.complete_task(conn, child_id, summary="must not approve")
         grandchild = kb.get_task(conn, grandchild_id)
-        assert grandchild is not None
-        assert grandchild.status == "todo"
-
-    response = client.patch(
-        f"/api/plugins/kanban/tasks/{parent_id}",
-        json={"status": "done"},
-    )
-    assert response.status_code == 200, response.text
-
-    with kb.connect() as conn:
-        child = kb.get_task(conn, child_id)
-        assert child is not None
-        assert child.status == "review"
-        review = kb.claim_review_task(conn, child_id)
-        assert review is not None
-        assert kb.complete_task(
-            conn,
-            child_id,
-            summary="approved after parent stabilized",
-            expected_run_id=review.current_run_id,
-        )
-        grandchild = kb.get_task(conn, grandchild_id)
-        assert grandchild is not None
-        assert grandchild.status == "ready"
+        assert parent is not None and parent.status == "done"
+        assert child is not None and child.status == "running"
+        assert child.claim_lock is not None
+        assert grandchild is not None and grandchild.status == "todo"
 
 
-def test_reopening_parent_recursively_retracts_done_and_running_descendants(client):
+def test_reopening_parent_preserves_running_descendant_authority(client):
     with kb.connect() as conn:
         parent_id = kb.create_task(conn, title="root", assignee="planner")
         assert kb.complete_task(conn, parent_id)
@@ -403,29 +379,17 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         f"/api/plugins/kanban/tasks/{parent_id}",
         json={"status": "ready"},
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 409, response.text
 
     with kb.connect() as conn:
+        parent = kb.get_task(conn, parent_id)
         child = kb.get_task(conn, child_id)
         grandchild = kb.get_task(conn, grandchild_id)
-        assert child is not None and child.status == "todo"
-        assert grandchild is not None and grandchild.status == "todo"
-        assert grandchild.current_run_id is None
-        assert kb.claim_task(conn, grandchild_id) is None
-        reclaimed = kb.latest_run(conn, grandchild_id)
-        assert reclaimed is not None
-        assert reclaimed.outcome == "reclaimed"
-
-    response = client.patch(
-        f"/api/plugins/kanban/tasks/{parent_id}",
-        json={"status": "done"},
-    )
-    assert response.status_code == 200, response.text
-    with kb.connect() as conn:
-        child = kb.get_task(conn, child_id)
-        grandchild = kb.get_task(conn, grandchild_id)
-        assert child is not None and child.status == "ready"
-        assert grandchild is not None and grandchild.status == "todo"
+        assert parent is not None and parent.status == "done"
+        assert child is not None and child.status == "done"
+        assert grandchild is not None and grandchild.status == "running"
+        assert grandchild.current_run_id == grandchild_run.current_run_id
+        assert grandchild.claim_lock is not None
 
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
@@ -442,14 +406,15 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         review = kb.claim_review_task(conn, task_id)
         assert review is not None
 
-    response = client.patch(
-        f"/api/plugins/kanban/tasks/{task_id}",
-        json={"status": "ready"},
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/reclaim",
+        json={"reason": "review recovery"},
     )
     assert response.status_code == 200, response.text
-    assert response.json()["task"]["status"] == "review"
-    assert response.json()["task"]["assignee"] == "reviewer"
     with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "review"
+        assert task.assignee == "reviewer"
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.outcome == "reclaimed"
@@ -1071,9 +1036,8 @@ def test_home_channels_lists_only_platforms_with_home(client, with_home_channels
 # ---------------------------------------------------------------------------
 
 
-def test_reclaim_endpoint_releases_running_claim(client):
-    """POST /tasks/<id>/reclaim drops the claim, returns ok, and emits
-    a manual reclaimed event."""
+def test_reclaim_endpoint_fails_closed_without_exact_identity(client):
+    """POST reclaim cannot release a manually forged PID-only claim."""
     import secrets
     conn = kb.connect()
     try:
@@ -1100,19 +1064,17 @@ def test_reclaim_endpoint_releases_running_claim(client):
         f"/api/plugins/kanban/tasks/{t}/reclaim",
         json={"reason": "browser recovery"},
     )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["ok"] is True
-    assert body["task_id"] == t
+    assert r.status_code == 409, r.text
 
-    # Confirm the task is back to ready.
+    # The forged row remains fenced for explicit operator repair.
     conn2 = kb.connect()
     try:
         row = conn2.execute(
-            "SELECT status, claim_lock FROM tasks WHERE id=?", (t,),
+            "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["status"] == "ready"
-        assert row["claim_lock"] is None
+        assert row["status"] == "running"
+        assert row["claim_lock"] == lock
+        assert row["worker_pid"] == 99999
     finally:
         conn2.close()
 

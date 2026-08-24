@@ -2643,6 +2643,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        # Progress-lease bound. Same resolution the gateway-embedded
+        # dispatcher and the standalone daemon use (one validated parser:
+        # 0 disables, invalid values fall back to the default), so a tick
+        # behaves identically whichever surface ran it.
+        no_progress_timeout_seconds = kb.resolve_no_progress_timeout_seconds(
+            _kanban_cfg.get("no_progress_timeout_seconds")
+        )
         # Memory-derived default when unset (OOF-30/OOF-77) — same
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
@@ -2658,6 +2665,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        no_progress_timeout_seconds = kb.DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2667,6 +2675,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            no_progress_timeout_seconds=no_progress_timeout_seconds,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2674,6 +2683,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "crashed": res.crashed,
             "timed_out": res.timed_out,
             "stale": res.stale,
+            "no_progress_deferred": res.no_progress_deferred,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
             "spawned": [
@@ -2699,6 +2709,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Stale:        {len(res.stale)}")
     if res.stale:
         print(f"  {', '.join(res.stale)}")
+    # Progress-lease expiries are detected and held, never reclaimed here:
+    # the card stays running under its claim. Say so, or a held card reads
+    # as an idle tick.
+    print(f"No progress (deferred): {len(res.no_progress_deferred)}")
+    if res.no_progress_deferred:
+        print(f"  {', '.join(res.no_progress_deferred)}  (claim held, still running)")
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")

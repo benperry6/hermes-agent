@@ -300,7 +300,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
-| `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
+| `kanban_heartbeat` | Signal liveness during long operations. Renews the liveness lease only — never the progress lease, whatever its note says. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
@@ -398,7 +398,7 @@ Every profile that works kanban tasks automatically gets the worker lifecycle �
 
 1. On spawn, call `kanban_show()` to read title + body + parent handoffs + prior attempts + full comment thread.
 2. `cd $HERMES_KANBAN_WORKSPACE` (via the terminal tool) and do the work there.
-3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** — the dispatcher reclaims tasks that have been running past `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no heartbeat in the last hour, on the assumption the worker crashed without cleanup. A reclaim is benign (the task goes back to `ready` for re-dispatch without a failure-counter tick) but you lose your current run's progress.
+3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** — the dispatcher reclaims tasks that have been running past `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no heartbeat in the last hour, on the assumption the worker crashed without cleanup. A reclaim is benign (the task goes back to `ready` for re-dispatch without a failure-counter tick) but you lose your current run's progress. A heartbeat renews *liveness* only; see [Liveness vs. progress](#liveness-vs-progress-no-progress-detection) for the separate progress lease.
 4. Complete with `kanban_complete(summary="...", metadata={...})`, or `kanban_block(reason="...")` if stuck.
 
 That final `kanban_complete` / `kanban_block` call is part of the worker
@@ -802,6 +802,26 @@ kanban:
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
+
+### Liveness vs. progress (no-progress detection)
+
+A running claim carries two independent leases:
+
+| Lease | Column | Renewed by |
+|-------|--------|------------|
+| **Liveness** — "the worker and its provider are responsive" | `last_heartbeat_at` + `claim_expires` | Any agent activity: stream tokens, API waits, the in-flight tool ticker, and `kanban_heartbeat` (with or without a note). |
+| **Progress** — "something observable happened outside the model's token stream" | `last_progress_at` | The claim itself; a *verified* tool execution (dispatched, able to change the task's world, and successful — read-only tools, refused or failed calls, and agent-bookkeeping tools like `todo`/`memory`/`kanban_heartbeat` never count); a durable board transition (comment, attach, link, block, complete, review). |
+
+Nothing the model *writes* renews progress — a `kanban_heartbeat` note is recorded as commentary and has no effect on any lease — so a slow single model call survives on liveness while a reasoning-only loop is bounded.
+
+When a running task's progress lease is older than `kanban.no_progress_timeout_seconds` (default `2700`, 45 minutes; `0` disables; values under 60 are refused with a warning and fall back to the default), the dispatcher **detects and reports** it: it writes a durable `no_progress_deferred` event (with the progress age, the liveness age, the pid and claim it observed) and holds the claim for a bounded grace (15 minutes), re-issuing the receipt at most once per grace window while the condition persists. It does **not** terminate the worker, requeue the task, or count a failure — the card keeps its status, claim, PID and run, and the existing crash / stale / max-runtime paths and manual `hermes kanban reclaim` remain the recovery levers. The receipt surfaces as a `no_progress_deferred` line in `hermes kanban dispatch` output, a `no_progress_deferred` diagnostic on `hermes kanban show` and the dashboard, and a passive notification to gateway / TUI / desktop subscribers (it never wakes the creating agent, because the task is still running).
+
+```yaml
+kanban:
+  no_progress_timeout_seconds: 2700   # 0 disables detection
+```
+
+The same validated value is used by the gateway-embedded dispatcher, `hermes kanban dispatch`, the standalone daemon and the dashboard's dispatch nudge, so a tick behaves identically whichever surface ran it.
 
 ### Scheduled task starts (`scheduled_at`)
 

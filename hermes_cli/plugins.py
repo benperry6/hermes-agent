@@ -344,10 +344,14 @@ VALID_HOOKS: Set[str] = {
     # Kwargs: board: str | None, profile_name: str, dry_run: bool,
     #   outcome: "ok" | "skipped_locked" | "idle",
     #   result: hermes_cli.kanban_db.DispatchResult (spawned, reclaimed,
-    #     promoted, reconciled_orphans, crashed, stale, timed_out,
-    #     auto_blocked, rate_limited, auto_assigned_default,
+    #     promoted, reconciled_orphans, crashed, stale, no_progress_deferred,
+    #     timed_out, auto_blocked, rate_limited, auto_assigned_default,
     #     respawn_guarded, skipped_per_profile_capped, skipped_unassigned,
-    #     skipped_nonspawnable, skipped_locked).
+    #     skipped_nonspawnable, skipped_locked). ``no_progress_deferred``
+    #     carries the running tasks whose progress lease expired this tick
+    #     and were reported with a ``no_progress_deferred`` receipt while
+    #     keeping their claim (see kanban_db.detect_no_progress_running);
+    #     a tick whose only action was such a receipt reports outcome="ok".
     #   Privacy: result carries task ids, assignees, and workspace paths.
     "on_kanban_dispatch_tick",
     # Gateway platform-boundary observer hooks (#64176). Observer-only; each

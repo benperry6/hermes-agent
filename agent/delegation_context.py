@@ -10,6 +10,13 @@ Cron jobs need the same treatment for the same reason: ``cronjob(action="run")``
 executes ``run_job()`` in-process, so a cron agent fired from inside a Kanban
 worker would otherwise inherit that worker's dispatcher identity.
 ``non_dispatcher_owned_context()`` covers both cases.
+
+A third leak is a nested ``hermes chat`` subprocess launched from a worker
+terminal (for example ``hermes chat -Q … --source tool`` for Browser Use).
+Those children inherit ``os.environ`` and are a new process, so ContextVars
+cannot help. ``scrub_kanban_lifecycle_ownership`` / the cmd_chat startup
+drop close that path unless the process was explicitly launched as the
+board worker.
 """
 from __future__ import annotations
 
@@ -34,8 +41,14 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
+# One-shot native launch proof emitted by the Kanban spawner. It prevents
+# accidental/passive lifecycle inheritance; it is not authentication against a
+# malicious same-user process that can inspect another process's launch state.
+KANBAN_WORKER_LAUNCH_MARKER = "HERMES_KANBAN_WORKER_LAUNCH"
+
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
+    KANBAN_WORKER_LAUNCH_MARKER,
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_WORKSPACE",
     "HERMES_KANBAN_WORKSPACES_ROOT",
@@ -44,6 +57,18 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_DB",
 )
 
+# Lifecycle ownership only. Board routing pins (BOARD / DB) stay on ordinary
+# terminal children so ``hermes kanban`` shell-outs remain on the same board
+# (#20074). A child ``hermes chat`` must not inherit the run identity that
+# makes ``kanban_complete`` default to the parent card.
+KANBAN_LIFECYCLE_OWNERSHIP_KEYS: tuple[str, ...] = (
+    "HERMES_KANBAN_TASK",
+    KANBAN_WORKER_LAUNCH_MARKER,
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_CLAIM_LOCK",
+)
 
 @contextmanager
 def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
@@ -137,6 +162,83 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
         cleaned.pop(key, None)
     cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
+
+
+def scrub_kanban_lifecycle_ownership(
+    env: Mapping[str, str] | MutableMapping[str, str],
+) -> dict[str, str]:
+    """Strip run/workspace ownership from a child-process environment.
+
+    Unlike :func:`scrub_kanban_env`, this does **not** set the delegated-child
+    marker and does **not** remove board routing pins. Use it on every
+    subprocess spawn from a Kanban worker so a nested ``hermes chat`` cannot
+    inherit ``HERMES_KANBAN_TASK``.
+    """
+    cleaned = dict(env)
+    for key in KANBAN_LIFECYCLE_OWNERSHIP_KEYS:
+        cleaned.pop(key, None)
+    return cleaned
+
+
+def is_explicit_board_worker_launch(
+    *,
+    source: str | None,
+    task_id: str | None,
+    launch_marker: str | None,
+    launch_arg: str | None,
+) -> bool:
+    """True only for the native dispatcher's one-shot launch contract.
+
+    Query text is deliberately irrelevant: a human phrase cannot authenticate
+    a worker. Source and task id must be present, while the fresh env nonce and
+    hidden argv nonce must agree exactly. The public task id is never proof.
+    """
+    tid = task_id or ""
+    if not tid or tid != tid.strip():
+        return False
+    if (source or "") != "kanban":
+        return False
+    marker = launch_marker or ""
+    arg = launch_arg or ""
+    if not marker or marker != marker.strip() or marker == tid:
+        return False
+    return marker == arg
+
+
+def drop_inherited_kanban_lifecycle_if_not_board_worker(
+    *,
+    source: str | None = None,
+    launch_arg: str | None = None,
+    environ: MutableMapping[str, str] | None = None,
+) -> bool:
+    """Drop inherited lifecycle ownership unless this process is the worker.
+
+    Returns True when lifecycle authority was rejected and removed. A valid
+    worker keeps its runtime ownership, consumes only the one-shot launch
+    marker, and returns False. Mutates *environ* (default ``os.environ``) so a
+    child ``hermes chat`` that slipped past spawn-time scrubbing still cannot
+    ``kanban_complete`` the parent card.
+    """
+    import os
+
+    env = os.environ if environ is None else environ
+    task = env.get("HERMES_KANBAN_TASK") or ""
+    resolved_source = source if source is not None else env.get("HERMES_SESSION_SOURCE")
+    if is_explicit_board_worker_launch(
+        source=resolved_source,
+        task_id=task,
+        launch_marker=env.get(KANBAN_WORKER_LAUNCH_MARKER),
+        launch_arg=launch_arg,
+    ):
+        # Consume the one-shot env proof immediately. Runtime ownership keys
+        # remain for the real worker, but no raw-env child can inherit enough
+        # material to mint itself as another worker.
+        env.pop(KANBAN_WORKER_LAUNCH_MARKER, None)
+        return False
+    removed = any(key in env for key in KANBAN_LIFECYCLE_OWNERSHIP_KEYS)
+    for key in KANBAN_LIFECYCLE_OWNERSHIP_KEYS:
+        env.pop(key, None)
+    return removed
 
 
 def delegated_child_subprocess_env(

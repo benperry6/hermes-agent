@@ -27,6 +27,8 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -189,8 +191,8 @@ def test_request_review_refuses_to_clear_live_claim_without_ownership(
 
     ``request_review`` on a running+claimed task without ``expected_run_id``
     fails with a distinct reason instead of silently NULLing claim_lock /
-    worker_pid. ``force=True`` (explicit human override) and the worker path
-    (``expected_run_id=<own run>``) both still work.
+    worker_pid. The owning worker path (``expected_run_id=<own run>``) works;
+    ``force=True`` is deliberately not a process-quiescence override.
     """
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="live claim", assignee="worker")
@@ -200,7 +202,7 @@ def test_request_review_refuses_to_clear_live_claim_without_ownership(
         # 1) No run id, no force -> refused with a distinct reason.
         ok, reason = kb.request_review(conn, tid, with_reason=True)
         assert ok is False
-        assert reason is not None and "live claim" in reason
+        assert reason is not None and "expected_run_id" in reason
         row = conn.execute(
             "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
             (tid,),
@@ -216,12 +218,14 @@ def test_request_review_refuses_to_clear_live_claim_without_ownership(
         ) is True
         assert kb.get_task(conn, tid).status == "review"
 
-    # 3) force=True: explicit human override on a fresh live-claimed task.
+    # 3) force=True does not bypass the retained process fence.
     with kb.connect() as conn:
         tid2 = kb.create_task(conn, title="forced", assignee="worker")
         assert kb.claim_task(conn, tid2) is not None
-        assert kb.request_review(conn, tid2, summary="override", force=True) is True
-        assert kb.get_task(conn, tid2).status == "review"
+        assert kb.request_review(conn, tid2, summary="override", force=True) is False
+        forced = kb.get_task(conn, tid2)
+        assert forced is not None and forced.status == "running"
+        assert forced.claim_lock is not None
 
 
 def test_request_review_malformed_provenance_gets_distinct_reason(

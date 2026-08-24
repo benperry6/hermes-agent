@@ -86,12 +86,10 @@ def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
             parent_id in c.body and c.author == "operator" for c in comments
         ), f"no invalidation comment naming {parent_id} on {tid}"
 
-    assert result["terminations"] == []
+    assert result["blocked"] == []
 
 
-def test_running_descendant_event_precedes_termination_via_reclaim_helper(
-    conn, tmp_path, monkeypatch,
-):
+def test_running_descendant_blocks_invalidation_without_signal(conn, monkeypatch):
     parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
     assert kb.complete_task(conn, parent_id)
     child_id = kb.create_task(
@@ -102,34 +100,27 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     kb._set_worker_pid(conn, child_id, 424242)
 
     kills: list[tuple] = []
-
-    def fake_terminate(pid, claim_lock, **kwargs):
-        # The audit trail must already be durable when the kill fires:
-        # standalone calls commit before terminating.
-        side = kb.connect(tmp_path / "kanban.db")
-        try:
-            kinds = [e.kind for e in kb.list_events(side, child_id)]
-        finally:
-            side.close()
-        assert "descendant_invalidated" in kinds
-        kills.append((pid, claim_lock))
-        return {"terminated": True}
-
-    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda pid, claim_lock, **kwargs: kills.append((pid, claim_lock)),
+    )
 
     _reopen_parent_directly(conn, parent_id)
     result = kb.invalidate_descendants_for_parent_reopen(
         conn, parent_id, author="operator",
     )
 
-    assert kills and kills[0][0] == 424242
-    assert result["terminations"] == kills
+    assert result == {"invalidated": [], "blocked": [child_id]}
+    assert kills == []
     child = kb.get_task(conn, child_id)
-    assert child is not None
-    assert child.status == "todo"
-    assert child.current_run_id is None
-    run = kb.latest_run(conn, child_id)
-    assert run is not None and run.outcome == "reclaimed"
+    assert child is not None and child.status == "running"
+    assert child.current_run_id == claimed.current_run_id
+    assert child.claim_lock is not None
+    assert not any(
+        event.kind == "descendant_invalidated"
+        for event in kb.list_events(conn, child_id)
+    )
 
 
 def test_counter_reset_on_invalidated_descendants(conn):

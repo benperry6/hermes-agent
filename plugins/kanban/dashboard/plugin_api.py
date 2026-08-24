@@ -1099,40 +1099,25 @@ def _parents_blocking_ready(
 def _invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection,
     parent_id: str,
-    terminations: list[tuple[Optional[int], Optional[str]]],
 ) -> None:
-    """Delegate to the domain-layer implementation in :mod:`kanban_db`.
-
-    Kept as a thin shim so ``_set_status_direct`` stays readable; the actual
-    invalidation (recursive-CTE discovery, per-descendant events + comments,
-    run closing, failure-counter reset) lives in
-    :func:`kanban_db.invalidate_descendants_for_parent_reopen` so every
-    reopen surface shares one implementation. We run inside the caller's
-    open transaction, so the domain function composes via a savepoint and
-    returns the worker terminations for us to perform post-commit (events
-    must be durable BEFORE the kill).
-    """
+    """Delegate fail-closed descendant invalidation to the domain layer."""
     result = kanban_db.invalidate_descendants_for_parent_reopen(
         conn, parent_id, author="dashboard",
     )
-    terminations.extend(result["terminations"])
+    if result["blocked"]:
+        raise RuntimeError("descendant worker authority appeared during reopen")
 
 
 def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
 ) -> bool:
-    """Direct status write for drag-drop moves that aren't covered by the
-    structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed.
+    """Direct status write for non-running drag/drop moves.
 
-    When this transitions OFF ``running`` to anything other than the
-    terminal verbs above (which own their own run closing), we close the
-    active run with outcome='reclaimed' so attempt history isn't
-    orphaned. ``running -> ready`` via drag-drop is the common case
-    (user yanking a stuck worker back to the queue).
+    Structured complete/block/unblock/archive verbs own their transitions.
+    ``running -> other`` is refused because drag/drop is not process-
+    termination authority; operators must use guarded reclaim instead.
+    A successful move appends a ``status`` event for the live feed.
     """
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
-    effective_status = new_status
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
@@ -1142,38 +1127,48 @@ def _set_status_direct(
         ).fetchone()
         if prev is None:
             return False
+        if new_status == prev["status"]:
+            return True
+        retained_authority = bool(
+            prev["claim_lock"]
+            or prev["worker_pid"]
+            or prev["current_run_id"]
+        )
+        if prev["status"] == "running" or retained_authority:
+            # Dashboard drag/drop is not a termination authority boundary.
+            # Operators must use the exact-identity reclaim/terminal verbs.
+            return False
 
-        if prev["status"] == "running" and new_status == "ready":
-            resume_status = kanban_db._retry_status_for_run(
-                conn, task_id, prev["current_run_id"]
-            )
-            if resume_status == "review":
-                effective_status = (
-                    "review"
-                    if kanban_db._parents_satisfied(conn, task_id)
-                    else "todo"
-                )
+        # Canonical dependency gate includes both terminal parent status and
+        # release of every parent worker fence.
+        if new_status == "ready" and not kanban_db._parents_satisfied(
+            conn, task_id,
+        ):
+            return False
 
-        # Guard: don't allow promoting to 'ready' unless all parents are done.
-        # Prevents the dispatcher from spawning a child whose upstream work
-        # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
-        if effective_status == "ready":
-            parent_statuses = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if parent_statuses and not all(
-                p["status"] in {"done", "archived"} for p in parent_statuses
-            ):
-                return False
-
-        was_running = prev["status"] == "running"
         reopening_satisfied_parent = (
             prev["status"] in {"done", "archived"}
-            and effective_status not in {"done", "archived"}
+            and new_status not in {"done", "archived"}
         )
+        if reopening_satisfied_parent:
+            fenced_descendant = conn.execute(
+                """
+                WITH RECURSIVE descendants(id) AS (
+                    SELECT child_id FROM task_links WHERE parent_id = ?
+                    UNION
+                    SELECT l.child_id FROM task_links l
+                    JOIN descendants d ON d.id = l.parent_id
+                )
+                SELECT 1 FROM descendants d
+                JOIN tasks t ON t.id = d.id
+                WHERE t.status = 'running' OR t.claim_lock IS NOT NULL
+                   OR t.worker_pid IS NOT NULL OR t.current_run_id IS NOT NULL
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if fenced_descendant is not None:
+                return False
 
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
@@ -1182,32 +1177,23 @@ def _set_status_direct(
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
             "WHERE id = ?",
             (
-                effective_status,
-                effective_status,
-                effective_status,
-                effective_status,
+                new_status,
+                new_status,
+                new_status,
+                new_status,
                 task_id,
             ),
         )
         if cur.rowcount != 1:
             return False
-        run_id = None
-        if was_running and effective_status != "running" and prev["current_run_id"]:
-            run_id = kanban_db._end_run(
-                conn, task_id,
-                outcome="reclaimed", status="reclaimed",
-                summary=f"status changed to {effective_status} (dashboard/direct)",
-            )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-            "VALUES (?, ?, 'status', ?, ?)",
+            "VALUES (?, NULL, 'status', ?, ?)",
             (
                 task_id,
-                run_id,
                 json.dumps(
                     {
-                        "status": effective_status,
+                        "status": new_status,
                         "requested_status": new_status,
                     }
                 ),
@@ -1218,12 +1204,9 @@ def _set_status_direct(
             _invalidate_descendants_for_parent_reopen(
                 conn,
                 task_id,
-                terminations,
             )
-    for pid, claim_lock in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock)
     # If we re-opened something, children may have gone stale.
-    if effective_status in {"done", "ready", "review"}:
+    if new_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
     return True
 
@@ -2290,6 +2273,15 @@ def dispatch(
     try:
         result = kanban_db.dispatch_once(
             conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            # Same progress bound the gateway/CLI/daemon ticks resolve, so a
+            # dashboard nudge cannot behave differently from a scheduled tick.
+            no_progress_timeout_seconds=(
+                kanban_db.resolve_no_progress_timeout_seconds(
+                    kanban_db.configured_kanban_setting(
+                        "no_progress_timeout_seconds"
+                    )
+                )
+            ),
         )
         # DispatchResult is a dataclass.
         try:

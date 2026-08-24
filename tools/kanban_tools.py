@@ -31,7 +31,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Optional
+import threading
+from typing import Any, Mapping, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
@@ -295,7 +296,7 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
 #     explicit tool which carries a model-supplied note.
 
 _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
-_auto_heartbeat_last_attempt: float = 0.0
+_auto_heartbeat_last_attempt: Optional[float] = None
 
 
 def heartbeat_current_worker_from_env() -> bool:
@@ -325,7 +326,11 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
     import time as _time
     now = _time.monotonic()
-    if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
+    if (
+        _auto_heartbeat_last_attempt is not None
+        and (now - _auto_heartbeat_last_attempt)
+        < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS
+    ):
         return False
     _auto_heartbeat_last_attempt = now
     try:
@@ -354,6 +359,186 @@ def heartbeat_current_worker_from_env() -> bool:
         return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Verified tool execution → board-PROGRESS bridge
+# ---------------------------------------------------------------------------
+# The liveness bridge above proves the provider is answering, not that the
+# worker is accomplishing anything — conflating the two is what let a worker
+# reason for thousands of tokens with zero tool calls while renewing its claim
+# indefinitely. Progress is a separate lease (``tasks.last_progress_at``) and
+# this bridge is its only callable renewal path. The tool executor calls it
+# once per tool call, AFTER the call returned, with the observed result.
+#
+# Only a VERIFIED execution counts, and the verification is done here rather
+# than trusted from the caller:
+#   * refused  — the call was blocked by scope/plugin/guardrail policy and
+#                never ran;
+#   * non_task — tools whose only effect is the agent's own state (the lease
+#                itself, its todo list, its memory store). A looping model can
+#                call these at will and they say nothing about the task;
+#   * read_only — tools that cannot change the task's world (the same
+#                classification the interrupt-safety code uses); a loop of
+#                reads is still a loop;
+#   * failed   — a non-zero exit, an error payload, a raised tool: the attempt
+#                proved nothing landed;
+#   * unverified — no observed result at all ("a tool was attempted" is not
+#                evidence).
+# Everything else is ``verified``. Same best-effort contract as the liveness
+# bridge: never raise into the agent loop, no-op outside a dispatcher-owned
+# worker, one DB write per ``_AUTO_PROGRESS_MIN_INTERVAL_SECONDS``.
+
+NON_PROGRESS_TOOL_NAMES = frozenset({"kanban_heartbeat", "todo", "memory"})
+
+# Multiplexed tools need their selected action as well as their name. These
+# actions only observe/control-plane state; repeating them is still a loop.
+NON_PROGRESS_TOOL_ACTIONS = {
+    "process": frozenset({"list", "poll", "log", "wait"}),
+    "computer_use": frozenset({
+        "capture", "list_apps", "list_windows", "wait", "cua_browser_state",
+    }),
+    "cronjob": frozenset({"list"}),
+    "delegate_task": frozenset({"list"}),
+}
+
+_AUTO_PROGRESS_MIN_INTERVAL_SECONDS = 20.0
+# ``None`` is the never-attempted sentinel (a worker launched in the first
+# limiter window after boot must not lose its first stamp to a small
+# monotonic uptime); every float is a real stamp.
+_auto_progress_last_attempt: Optional[float] = None
+# Concurrent tool calls complete on worker threads and all touch this
+# timestamp. Read-compare-write without a lock lets two threads both observe
+# the old value and both write, which is how a limiter silently stops
+# limiting. Its own lock and its own timestamp: a recent liveness write must
+# never suppress a progress stamp.
+_auto_progress_lock = threading.Lock()
+
+
+def tool_call_is_progress_evidence(
+    tool_name: Optional[str],
+    result: Any,
+    *,
+    tool_args: Optional[Mapping[str, Any]] = None,
+    blocked: bool = False,
+) -> tuple[bool, str]:
+    """Classify one completed tool call. Returns ``(counts, reason)``.
+
+    Pure and side-effect free so the boundary can be asserted directly.
+    Order matters: a refused call is ``refused`` whatever the tool, a
+    bookkeeping or read-only tool is never evidence however it succeeded,
+    and only a side-effect-capable tool's SUCCESS is ``verified``.
+    """
+    if blocked:
+        return False, "refused"
+    name = tool_name or ""
+    if name in NON_PROGRESS_TOOL_NAMES:
+        return False, "non_task"
+    action = str((tool_args or {}).get("action") or "").strip()
+    if action and action in NON_PROGRESS_TOOL_ACTIONS.get(name, ()):
+        return False, "read_only"
+    from agent.tool_result_classification import tool_may_have_side_effect
+    if not tool_may_have_side_effect(name):
+        return False, "read_only"
+    if result is None:
+        return False, "unverified"
+    from agent.display import _detect_tool_failure
+    try:
+        failed, _suffix = _detect_tool_failure(name, result)
+    except Exception:
+        # An unclassifiable result is not evidence.
+        return False, "unverified"
+    if failed:
+        return False, "failed"
+    # Stricter than the CLI's failure tag, which for some tools keys off a
+    # single field (terminal: exit_code): a payload that SAYS it errored,
+    # was blocked or was cancelled proves nothing landed, whatever else it
+    # carries.
+    data: Any = result if isinstance(result, Mapping) else None
+    if isinstance(result, str):
+        from utils import safe_json_loads
+        data = safe_json_loads(result)
+    if isinstance(data, Mapping):
+        status = str(data.get("status") or "").lower()
+        effect = str(data.get("effect") or "").lower()
+        exit_code = data.get("exit_code")
+        if (
+            data.get("error")
+            or data.get("ok") is False
+            or data.get("success") is False
+            or data.get("verified") is False
+            or status in {
+                "blocked", "cancelled", "error", "failed", "refused", "timeout",
+            }
+            or effect in {"suspected_noop", "refused"}
+            or (isinstance(exit_code, int) and exit_code != 0)
+        ):
+            return False, "failed"
+    return True, "verified"
+
+
+def note_tool_progress_from_env(
+    tool_name: Optional[str],
+    result: Any = None,
+    *,
+    tool_args: Optional[Mapping[str, Any]] = None,
+    blocked: bool = False,
+) -> bool:
+    """Renew the kanban PROGRESS lease for a verified tool execution.
+
+    ``tool_name`` and ``result`` describe the call that just completed;
+    ``blocked`` says the middleware refused it. Only a call that
+    :func:`tool_call_is_progress_evidence` accepts reaches the board, and
+    only for the task / run / claim this process was spawned for
+    (``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID`` /
+    ``HERMES_KANBAN_CLAIM_LOCK``): the DB layer refuses a superseded run or
+    a foreign claim, so a reclaimed worker cannot resurrect the lease of the
+    attempt that replaced it. A delegate_task child or an in-process cron
+    job does not own the task and is ignored even with the env present.
+
+    Returns True when a progress write was attempted, False when the call
+    was skipped (not a worker, not evidence, rate-limited, or a swallowed
+    error). Informational — callers must not branch on it.
+    """
+    global _auto_progress_last_attempt
+    tid = _default_task_id(None)
+    if not tid:
+        return False
+    counts, _reason = tool_call_is_progress_evidence(
+        tool_name, result, tool_args=tool_args, blocked=blocked,
+    )
+    if not counts:
+        return False
+
+    import time as _time
+    with _auto_progress_lock:
+        now = _time.monotonic()
+        if (
+            _auto_progress_last_attempt is not None
+            and now - _auto_progress_last_attempt
+            < _AUTO_PROGRESS_MIN_INTERVAL_SECONDS
+        ):
+            return False
+        _auto_progress_last_attempt = now
+
+    try:
+        kb, conn = _connect()
+        try:
+            kb.record_progress(
+                conn, tid,
+                source=kb.PROGRESS_SOURCE_TOOL,
+                expected_run_id=_worker_run_id(tid),
+                claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or None,
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return True
+    except Exception:
+        logger.debug("auto-progress: bridge failed", exc_info=True)
         return False
 
 
@@ -1982,8 +2167,10 @@ KANBAN_HEARTBEAT_SCHEMA = {
     "description": (
         "Signal that you're still alive during a long operation "
         "(training, encoding, large crawls). Call every few minutes so "
-        "humans see liveness separately from PID checks. Pure side "
-        "effect — no work changes."
+        "humans see liveness separately from PID checks. Renews LIVENESS "
+        "only: the separate progress lease moves only when you actually "
+        "run a tool that changes something or move the card, never on a "
+        "heartbeat or its note. Pure side effect — no work changes."
     ),
     "parameters": {
         "type": "object",
@@ -1995,8 +2182,9 @@ KANBAN_HEARTBEAT_SCHEMA = {
             "note": {
                 "type": "string",
                 "description": (
-                    "Optional short note describing current progress. "
-                    "Shown in the event log."
+                    "Optional short note on what you are waiting for. "
+                    "Recorded in the event log for humans to read; it has "
+                    "no effect on any lease."
                 ),
             },
             "board": _board_schema_prop(),

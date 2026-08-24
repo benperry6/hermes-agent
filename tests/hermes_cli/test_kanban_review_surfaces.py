@@ -10,6 +10,8 @@ import pytest
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 @pytest.fixture
 def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:

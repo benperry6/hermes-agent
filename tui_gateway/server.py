@@ -10362,7 +10362,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
+    "no_progress_deferred", "status", "archived", "unblocked",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -10504,6 +10504,20 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         except (TypeError, ValueError):
             pass
         return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+    if kind == "no_progress_deferred":
+        # Detection only: the worker is alive but has shown no verified
+        # progress, and the dispatcher is holding the claim. Nothing was
+        # terminated or requeued — say exactly that.
+        age = limit = 0
+        try:
+            age = int(payload.get("progress_age_seconds") or 0)
+            limit = int(payload.get("timeout_seconds") or 0)
+        except (TypeError, ValueError):
+            pass
+        return (
+            f"⏳ {board_tag}{tag}Kanban {task_id} no observable progress for "
+            f"{age}s (limit {limit}s); claim held, worker still running"
+        )
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
     return None

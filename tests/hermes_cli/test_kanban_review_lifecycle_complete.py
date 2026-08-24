@@ -19,6 +19,8 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_diagnostics as kd
 
+pytestmark = pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle")
+
 
 @pytest.fixture
 def conn(tmp_path: Path):
@@ -467,14 +469,15 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
         "Timeout during review",
         max_runtime_seconds=1,
     )
+    kb._set_worker_pid(conn, timed_out_id, 999_998)
     with kb.write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
-            (999_998, old, timed_out_id),
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (old, timed_out_id),
         )
         conn.execute(
-            "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
-            (999_998, old, timed_out_run.current_run_id),
+            "UPDATE task_runs SET started_at = ? WHERE id = ?",
+            (old, timed_out_run.current_run_id),
         )
     assert timed_out_id in kb.enforce_max_runtime(conn, signal_fn=lambda *_: None)
     timed_out = kb.get_task(conn, timed_out_id)

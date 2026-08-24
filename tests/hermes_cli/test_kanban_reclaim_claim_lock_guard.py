@@ -22,6 +22,11 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = [
+    pytest.mark.usefixtures("synthetic_kanban_worker_lifecycle"),
+    pytest.mark.live_system_guard_bypass,
+]
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):

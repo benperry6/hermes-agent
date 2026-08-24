@@ -26,6 +26,23 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _resolve_no_progress_timeout_seconds(
+    kanban_cfg: dict[str, Any],
+    kb: Any,
+) -> int:
+    """Resolve ``kanban.no_progress_timeout_seconds`` through the DB layer.
+
+    The gateway deliberately owns no validity rules of its own: the DB
+    parser is the single definition of a valid progress bound (bools,
+    non-integers, negatives and sub-minute windows fall back to the default
+    with a WARNING, 0 disables), so a gateway tick cannot drift from a CLI
+    or daemon tick.
+    """
+    return kb.resolve_no_progress_timeout_seconds(
+        kanban_cfg.get("no_progress_timeout_seconds")
+    )
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -239,7 +256,12 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        # ``no_progress_deferred`` is claimed and delivered so a subscriber
+        # learns the worker is alive but idle — but it is NOT a terminal
+        # outcome: the card is still running under a held claim, nothing
+        # was terminated or requeued, so it never wakes the creator (see
+        # _WAKE_KINDS below).
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "no_progress_deferred", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -602,6 +624,19 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
+                            )
+                        elif kind == "no_progress_deferred":
+                            _age = _limit = 0
+                            if ev.payload:
+                                try:
+                                    _age = int(ev.payload.get("progress_age_seconds") or 0)
+                                    _limit = int(ev.payload.get("timeout_seconds") or 0)
+                                except (TypeError, ValueError):
+                                    pass
+                            msg = (
+                                f"⏳ {board_tag}{tag}Kanban {sub['task_id']} no observable "
+                                f"progress for {_age}s (limit {_limit}s); claim held, "
+                                f"worker still running"
                             )
                         elif kind == "status":
                             new_status = ""
@@ -1360,6 +1395,20 @@ class GatewayKanbanWatchersMixin:
             )
             stale_timeout_seconds = 0
 
+        # kanban.no_progress_timeout_seconds — the PROGRESS lease bound.
+        # Unlike stale detection this is ON by default: a worker that is
+        # demonstrably alive but produces no verified tool execution and
+        # no board transition renews its claim forever otherwise. The
+        # detector only records a ``no_progress_deferred`` receipt and holds
+        # the claim; it never terminates or requeues. 0 disables.
+        no_progress_timeout_seconds = _resolve_no_progress_timeout_seconds(
+            kanban_cfg, _kb,
+        )
+        logger.info(
+            "kanban dispatcher: no_progress_timeout_seconds=%s",
+            no_progress_timeout_seconds or "disabled",
+        )
+
         # kanban.reconcile_orphans (config.yaml, default true): each tick,
         # requeue 'running' cards whose claim bookkeeping is broken (no
         # valid claim, dead/gone worker) — the zombie-card reconciliation
@@ -1500,6 +1549,7 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
+                    no_progress_timeout_seconds=no_progress_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,

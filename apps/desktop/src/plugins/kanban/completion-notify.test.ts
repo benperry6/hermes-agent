@@ -451,6 +451,22 @@ describe('terminal kinds beyond completed', () => {
     expect(hostMock.notify.mock.calls[2][0]).toMatchObject({ kind: 'warning', message: 't103' })
   })
 
+  it('no_progress_deferred notifies with a warning toast and the task id (claim held, still running)', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'no_progress_deferred', { progress_age_seconds: 3000, timeout_seconds: 2700 })
+    ])
+
+    expect(fired).toBe(true)
+    expect(lastNotify()).toMatchObject({
+      kind: 'warning',
+      title: 'No observable progress — claim held, worker still running',
+      message: 't101'
+    })
+  })
+
   it('silent kinds (status/archived/unblocked) advance the cursor but never notify', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
