@@ -146,6 +146,23 @@ class TestTerminalChildEnvStripsLifecycleOwnership:
         assert child["BROWSERBASE_API_KEY"] == "bb-keep"
         assert child["FIRECRAWL_API_KEY"] == "fc-keep"
 
+    def test_local_import_failure_still_scrubs_launch_proof(self, monkeypatch, tmp_path):
+        import builtins
+        from tools.environments import local
+
+        real_import = builtins.__import__
+
+        def _fail_helper_import(name, *args, **kwargs):
+            if name == "agent.delegation_context":
+                raise ImportError("helper unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _fail_helper_import)
+        child = local._scrub_kanban_lifecycle_ownership(_worker_env(tmp_path))
+        _assert_ownership_stripped(child)
+        assert child["HERMES_KANBAN_BOARD"] == "default"
+        assert child["HERMES_KANBAN_DB"].endswith("kanban.db")
+
 
 def test_lifecycle_keys_are_a_subset_of_full_kanban_env_keys():
     from agent.delegation_context import (
@@ -159,21 +176,22 @@ def test_lifecycle_keys_are_a_subset_of_full_kanban_env_keys():
     assert "HERMES_KANBAN_DB" not in KANBAN_LIFECYCLE_OWNERSHIP_KEYS
 
 
-def test_default_spawn_still_injects_worker_ownership(monkeypatch, tmp_path):
-    """Dispatcher-owned workers must still receive lifecycle vars."""
+def test_default_spawn_mints_fresh_one_shot_launch_proof(monkeypatch, tmp_path):
+    """Each native spawn pairs one fresh nonce across env and hidden argv."""
     from hermes_cli import kanban_db as kb
 
-    captured = {}
+    captured = []
+    nonces = iter(("launch-nonce-a", "launch-nonce-b"))
 
     class _Proc:
         pid = 4242
 
     def _fake_popen(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["env"] = kwargs["env"]
+        captured.append({"cmd": cmd, "env": kwargs["env"], "kwargs": kwargs})
         return _Proc()
 
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("secrets.token_urlsafe", lambda _bytes: next(nonces))
     monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
 
@@ -198,18 +216,23 @@ def test_default_spawn_still_injects_worker_ownership(monkeypatch, tmp_path):
     workspace = tmp_path / "ws"
     workspace.mkdir()
     kb._default_spawn(task, str(workspace))
+    kb._default_spawn(task, str(workspace))
 
-    env = captured["env"]
-    assert env["HERMES_KANBAN_TASK"] == "t_board_worker"
-    assert env["HERMES_KANBAN_RUN_ID"] == "7"
-    assert env["HERMES_KANBAN_WORKSPACE"] == str(workspace)
-    assert env["HERMES_KANBAN_CLAIM_LOCK"] == "lock-worker"
-    assert env["HERMES_KANBAN_WORKER_LAUNCH"] == "t_board_worker"
-    assert env["HERMES_SESSION_SOURCE"] == "kanban"
-    assert captured["cmd"][-5:] == [
-        "chat", "--kanban-worker-launch", "t_board_worker",
-        "-q", "work kanban task t_board_worker",
-    ]
+    assert len(captured) == 2
+    for call, nonce in zip(captured, ("launch-nonce-a", "launch-nonce-b")):
+        env = call["env"]
+        assert env["HERMES_KANBAN_TASK"] == "t_board_worker"
+        assert env["HERMES_KANBAN_RUN_ID"] == "7"
+        assert env["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+        assert env["HERMES_KANBAN_CLAIM_LOCK"] == "lock-worker"
+        assert env["HERMES_KANBAN_WORKER_LAUNCH"] == nonce
+        assert env["HERMES_KANBAN_WORKER_LAUNCH"] != task.id
+        launch_index = call["cmd"].index("--kanban-worker-launch")
+        assert call["cmd"][launch_index + 1] == nonce
+        assert call["kwargs"]["start_new_session"] is True
+    assert captured[0]["env"]["HERMES_KANBAN_WORKER_LAUNCH"] != (
+        captured[1]["env"]["HERMES_KANBAN_WORKER_LAUNCH"]
+    )
 
 
 def test_terminal_child_cannot_complete_parent_and_parent_stays_running(

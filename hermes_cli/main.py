@@ -2872,8 +2872,8 @@ def _drop_inherited_kanban_lifecycle(args) -> None:
     A Kanban worker that shells out to ``hermes chat --source tool`` (Browser
     Use benchmarks, local-model evals) used to keep ``HERMES_KANBAN_TASK``
     and could ``kanban_complete`` the parent card. A real worker needs matching
-    source, task-bound env marker, and hidden CLI launch argument; query text
-    is never authority.
+    source, a task id, and the same one-shot nonce in env and hidden CLI launch
+    argument; query text and the public task id are never launch proof.
     """
     try:
         from agent.delegation_context import (

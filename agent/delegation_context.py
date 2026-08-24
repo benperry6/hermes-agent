@@ -41,8 +41,9 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
-# One-shot machine proof emitted only by the native Kanban spawner. Its value
-# is the exact task id and must match the hidden CLI launch argument too.
+# One-shot native launch proof emitted by the Kanban spawner. It prevents
+# accidental/passive lifecycle inheritance; it is not authentication against a
+# malicious same-user process that can inspect another process's launch state.
 KANBAN_WORKER_LAUNCH_MARKER = "HERMES_KANBAN_WORKER_LAUNCH"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
@@ -186,18 +187,22 @@ def is_explicit_board_worker_launch(
     launch_marker: str | None,
     launch_arg: str | None,
 ) -> bool:
-    """True only for the native dispatcher's task-bound machine contract.
+    """True only for the native dispatcher's one-shot launch contract.
 
     Query text is deliberately irrelevant: a human phrase cannot authenticate
-    a worker. Source, durable task id, one-shot env marker, and hidden argv
-    proof must all agree exactly.
+    a worker. Source and task id must be present, while the fresh env nonce and
+    hidden argv nonce must agree exactly. The public task id is never proof.
     """
     tid = task_id or ""
     if not tid or tid != tid.strip():
         return False
     if (source or "") != "kanban":
         return False
-    return launch_marker == tid and launch_arg == tid
+    marker = launch_marker or ""
+    arg = launch_arg or ""
+    if not marker or marker != marker.strip() or marker == tid:
+        return False
+    return marker == arg
 
 
 def drop_inherited_kanban_lifecycle_if_not_board_worker(

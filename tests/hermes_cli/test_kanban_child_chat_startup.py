@@ -4,7 +4,7 @@ Defense in depth for the same incident as
 ``tests/tools/test_kanban_child_chat_env_isolation.py``: even if a child
 process is launched with a raw ``os.environ`` copy (outside the terminal
 sanitize path), ``cmd_chat`` must refuse to become the board worker unless
-it carries the task-bound machine marker emitted by the native dispatcher.
+it carries the one-shot native launch proof emitted by the dispatcher.
 """
 from __future__ import annotations
 
@@ -185,13 +185,13 @@ def test_explicit_board_worker_launch_keeps_ownership_for_any_query_wording(
         monkeypatch,
         tmp_path,
         task_id="t_board_worker",
-        launch_marker="t_board_worker",
+        launch_marker="launch-nonce-a",
     )
     main_mod.cmd_chat(
         _chat_args(
             source=None,
             query="execute the assigned board card now",
-            kanban_worker_launch="t_board_worker",
+            kanban_worker_launch="launch-nonce-a",
         )
     )
 
@@ -206,14 +206,15 @@ def test_explicit_board_worker_launch_keeps_ownership_for_any_query_wording(
 @pytest.mark.parametrize(
     "source, launch_marker, launch_arg",
     [
-        ("kanban", "t_board_worker", None),
-        ("kanban", None, "t_board_worker"),
-        ("kanban", "", "t_board_worker"),
-        ("kanban", "t_other", "t_board_worker"),
-        ("kanban", "t_board_worker", ""),
-        ("kanban", "t_board_worker", "t_other"),
-        ("tool", "t_board_worker", "t_board_worker"),
-        (" kanban ", "t_board_worker", "t_board_worker"),
+        ("kanban", "launch-nonce-a", None),
+        ("kanban", None, "launch-nonce-a"),
+        ("kanban", "", "launch-nonce-a"),
+        ("kanban", "launch-nonce-a", "launch-nonce-b"),
+        # The task id is public lifecycle data, not a launch proof.
+        ("kanban", "t_board_worker", "t_board_worker"),
+        ("kanban", "launch-nonce-a", ""),
+        ("tool", "launch-nonce-a", "launch-nonce-a"),
+        (" kanban ", "launch-nonce-a", "launch-nonce-a"),
     ],
 )
 def test_source_task_marker_and_flag_must_all_match(
@@ -248,22 +249,23 @@ def test_consumed_marker_cannot_authorize_a_nested_chat(
         monkeypatch,
         tmp_path,
         task_id="t_board_worker",
-        launch_marker="t_board_worker",
+        launch_marker="launch-nonce-a",
     )
     main_mod.cmd_chat(_chat_args(
         source="kanban",
         query="arbitrary worker wording",
-        kanban_worker_launch="t_board_worker",
+        kanban_worker_launch="launch-nonce-a",
     ))
     assert fake_cli["env"]["HERMES_KANBAN_TASK"] == "t_board_worker"
     assert os.environ.get("HERMES_KANBAN_WORKER_LAUNCH") is None
 
-    # A raw-env child can inherit the runtime task keys, but the consumed env
-    # marker and one-shot internal argv proof are both gone.
+    # A raw-env child can inherit the runtime task keys. Even if it reconstructs
+    # both proof positions from the public task id, startup must reject it.
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_LAUNCH", "t_board_worker")
     main_mod.cmd_chat(_chat_args(
         source="kanban",
         query="work kanban task t_board_worker",
-        kanban_worker_launch=None,
+        kanban_worker_launch="t_board_worker",
     ))
     for key in _OWNERSHIP_KEYS:
         assert fake_cli["env"].get(key) is None, key
@@ -274,8 +276,8 @@ def test_internal_worker_launch_flag_is_accepted_but_hidden_from_help():
 
     parser, _subparsers, chat_parser = build_top_level_parser()
     args = parser.parse_args([
-        "chat", "--kanban-worker-launch", "t_worker", "-q", "anything",
+        "chat", "--kanban-worker-launch", "launch-nonce-a", "-q", "anything",
     ])
 
-    assert args.kanban_worker_launch == "t_worker"
+    assert args.kanban_worker_launch == "launch-nonce-a"
     assert "--kanban-worker-launch" not in chat_parser.format_help()
