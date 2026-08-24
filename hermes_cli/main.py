@@ -2867,22 +2867,36 @@ def _pin_kanban_board_env() -> None:
 
 
 def _drop_inherited_kanban_lifecycle(args) -> None:
-    """Child chats must not inherit dispatcher run ownership.
+    """Validate and consume the native worker launch proof.
 
     A Kanban worker that shells out to ``hermes chat --source tool`` (Browser
     Use benchmarks, local-model evals) used to keep ``HERMES_KANBAN_TASK``
-    and could ``kanban_complete`` the parent card. The dispatcher worker
-    itself is identified by source ``kanban`` plus ``work kanban task <id>``.
+    and could ``kanban_complete`` the parent card. A real worker needs matching
+    source, task-bound env marker, and hidden CLI launch argument; query text
+    is never authority.
     """
     try:
         from agent.delegation_context import (
             drop_inherited_kanban_lifecycle_if_not_board_worker,
         )
-    except Exception:
+    except ImportError:
+        # Security boundary: validator unavailability must fail closed. Keep
+        # BOARD / DB routing pins so ordinary ``hermes kanban`` shell-outs stay
+        # on the selected board; remove only lifecycle ownership and launch
+        # proof. Other import-time exceptions are deliberately not swallowed.
+        for key in (
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_WORKSPACE",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_WORKER_LAUNCH",
+        ):
+            os.environ.pop(key, None)
         return
     drop_inherited_kanban_lifecycle_if_not_board_worker(
-        query=getattr(args, "query", None),
         source=os.environ.get("HERMES_SESSION_SOURCE"),
+        launch_arg=getattr(args, "kanban_worker_launch", None),
     )
 
 
@@ -2951,6 +2965,13 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    # Validate the one-shot Kanban worker launch proof before any startup work
+    # can spawn a child that inherits process env. An explicit --source wins
+    # over an inherited source exactly as it does for session tagging below.
+    if getattr(args, "source", None):
+        os.environ["HERMES_SESSION_SOURCE"] = args.source
+    _drop_inherited_kanban_lifecycle(args)
+
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
@@ -3200,16 +3221,6 @@ def cmd_chat(args):
     if getattr(args, "ignore_rules", False):
         os.environ["HERMES_IGNORE_RULES"] = "1"
 
-    # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
-    if getattr(args, "source", None):
-        os.environ["HERMES_SESSION_SOURCE"] = args.source
-
-    # Defer the drop when the query is still on disk: a --query-file board
-    # worker would otherwise look like an interactive child and lose ownership
-    # before the prompt is loaded.
-    if getattr(args, "query", None) or not getattr(args, "query_file", None):
-        _drop_inherited_kanban_lifecycle(args)
-
     _pin_kanban_board_env()
     _confirm_startup_expensive_model_override(args)
 
@@ -3259,9 +3270,6 @@ def cmd_chat(args):
         if not (args.query or "").strip():
             print(f"Error: --query-file {_qfile} is empty", file=sys.stderr)
             sys.exit(2)
-
-    # Query may have arrived via --query-file after the first ownership check.
-    _drop_inherited_kanban_lifecycle(args)
 
     # Build kwargs from args
     kwargs = {

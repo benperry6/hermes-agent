@@ -10762,6 +10762,10 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    # One-shot machine proof paired with the hidden CLI argument below. Only
+    # this native dispatcher boundary mints it; cmd_chat consumes it at startup.
+    from agent.delegation_context import KANBAN_WORKER_LAUNCH_MARKER
+    env[KANBAN_WORKER_LAUNCH_MARKER] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
@@ -10875,6 +10879,7 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        "--kanban-worker-launch", task.id,
         "-q", prompt,
     ])
     if task.goal_mode:

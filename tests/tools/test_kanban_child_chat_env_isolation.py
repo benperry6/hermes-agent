@@ -29,6 +29,7 @@ _OWNERSHIP_KEYS = (
     "HERMES_KANBAN_WORKSPACE",
     "HERMES_KANBAN_WORKSPACES_ROOT",
     "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_WORKER_LAUNCH",
 )
 
 _SAFE_SAMPLE = {
@@ -59,6 +60,7 @@ def _worker_env(tmp_path: Path) -> dict[str, str]:
             "HERMES_KANBAN_WORKSPACE": str(tmp_path / "parent-workspace"),
             "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
             "HERMES_KANBAN_CLAIM_LOCK": "lock-parent",
+            "HERMES_KANBAN_WORKER_LAUNCH": "t_parent",
             "HERMES_KANBAN_BOARD": "default",
             "HERMES_KANBAN_DB": str(tmp_path / ".hermes" / "kanban.db"),
             "HERMES_SESSION_SOURCE": "kanban",
@@ -167,6 +169,7 @@ def test_default_spawn_still_injects_worker_ownership(monkeypatch, tmp_path):
         pid = 4242
 
     def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
         captured["env"] = kwargs["env"]
         return _Proc()
 
@@ -201,7 +204,12 @@ def test_default_spawn_still_injects_worker_ownership(monkeypatch, tmp_path):
     assert env["HERMES_KANBAN_RUN_ID"] == "7"
     assert env["HERMES_KANBAN_WORKSPACE"] == str(workspace)
     assert env["HERMES_KANBAN_CLAIM_LOCK"] == "lock-worker"
+    assert env["HERMES_KANBAN_WORKER_LAUNCH"] == "t_board_worker"
     assert env["HERMES_SESSION_SOURCE"] == "kanban"
+    assert captured["cmd"][-5:] == [
+        "chat", "--kanban-worker-launch", "t_board_worker",
+        "-q", "work kanban task t_board_worker",
+    ]
 
 
 def test_terminal_child_cannot_complete_parent_and_parent_stays_running(

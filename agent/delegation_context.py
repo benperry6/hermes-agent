@@ -41,8 +41,13 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
+# One-shot machine proof emitted only by the native Kanban spawner. Its value
+# is the exact task id and must match the hidden CLI launch argument too.
+KANBAN_WORKER_LAUNCH_MARKER = "HERMES_KANBAN_WORKER_LAUNCH"
+
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
+    KANBAN_WORKER_LAUNCH_MARKER,
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_WORKSPACE",
     "HERMES_KANBAN_WORKSPACES_ROOT",
@@ -57,14 +62,12 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 # makes ``kanban_complete`` default to the parent card.
 KANBAN_LIFECYCLE_OWNERSHIP_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
+    KANBAN_WORKER_LAUNCH_MARKER,
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_WORKSPACE",
     "HERMES_KANBAN_WORKSPACES_ROOT",
     "HERMES_KANBAN_CLAIM_LOCK",
 )
-
-_BOARD_WORKER_QUERY_PREFIX = "work kanban task "
-
 
 @contextmanager
 def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
@@ -178,51 +181,59 @@ def scrub_kanban_lifecycle_ownership(
 
 def is_explicit_board_worker_launch(
     *,
-    query: str | None,
     source: str | None,
     task_id: str | None,
+    launch_marker: str | None,
+    launch_arg: str | None,
 ) -> bool:
-    """True only for the dispatcher worker argv/env contract.
+    """True only for the native dispatcher's task-bound machine contract.
 
-    ``_default_spawn`` launches ``hermes chat -q "work kanban task <id>"``
-    with ``HERMES_SESSION_SOURCE=kanban``. Any other child chat — including
-    ``hermes chat --source tool`` used by Browser Use benchmarks — is not
-    the board worker, even if it inherited the parent's env.
+    Query text is deliberately irrelevant: a human phrase cannot authenticate
+    a worker. Source, durable task id, one-shot env marker, and hidden argv
+    proof must all agree exactly.
     """
-    tid = (task_id or "").strip()
-    if not tid:
+    tid = task_id or ""
+    if not tid or tid != tid.strip():
         return False
-    if (source or "").strip() != "kanban":
+    if (source or "") != "kanban":
         return False
-    return (query or "").strip() == f"{_BOARD_WORKER_QUERY_PREFIX}{tid}"
+    return launch_marker == tid and launch_arg == tid
 
 
 def drop_inherited_kanban_lifecycle_if_not_board_worker(
     *,
-    query: str | None = None,
     source: str | None = None,
+    launch_arg: str | None = None,
     environ: MutableMapping[str, str] | None = None,
 ) -> bool:
     """Drop inherited lifecycle ownership unless this process is the worker.
 
-    Returns True when vars were removed. Mutates *environ* (default
-    ``os.environ``) so a child ``hermes chat`` that slipped past spawn-time
-    scrubbing still cannot ``kanban_complete`` the parent card.
+    Returns True when lifecycle authority was rejected and removed. A valid
+    worker keeps its runtime ownership, consumes only the one-shot launch
+    marker, and returns False. Mutates *environ* (default ``os.environ``) so a
+    child ``hermes chat`` that slipped past spawn-time scrubbing still cannot
+    ``kanban_complete`` the parent card.
     """
     import os
 
     env = os.environ if environ is None else environ
-    task = (env.get("HERMES_KANBAN_TASK") or "").strip()
-    if not task:
-        return False
+    task = env.get("HERMES_KANBAN_TASK") or ""
     resolved_source = source if source is not None else env.get("HERMES_SESSION_SOURCE")
     if is_explicit_board_worker_launch(
-        query=query, source=resolved_source, task_id=task
+        source=resolved_source,
+        task_id=task,
+        launch_marker=env.get(KANBAN_WORKER_LAUNCH_MARKER),
+        launch_arg=launch_arg,
     ):
+        # Consume the one-shot env proof immediately. Runtime ownership keys
+        # remain for the real worker, but no raw-env child can inherit enough
+        # material to mint itself as another worker.
+        env.pop(KANBAN_WORKER_LAUNCH_MARKER, None)
         return False
+    removed = any(key in env for key in KANBAN_LIFECYCLE_OWNERSHIP_KEYS)
     for key in KANBAN_LIFECYCLE_OWNERSHIP_KEYS:
         env.pop(key, None)
-    return True
+    return removed
 
 
 def delegated_child_subprocess_env(
