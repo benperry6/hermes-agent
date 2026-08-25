@@ -202,6 +202,69 @@ class TestMcpToolCallProjection:
         assert "error" in msgs[1]["content"]
 
 
+class TestMaterialToolEvidence:
+    @pytest.mark.parametrize(
+        "item,expected",
+        [
+            (
+                {
+                    "type": "commandExecution", "id": "ok", "command": "pwd",
+                    "cwd": "/tmp", "status": "completed",
+                    "aggregatedOutput": "ok", "exitCode": 0,
+                },
+                "exec_command",
+            ),
+            (
+                {
+                    "type": "commandExecution", "id": "bad", "command": "false",
+                    "cwd": "/tmp", "status": "completed",
+                    "aggregatedOutput": "no", "exitCode": 1,
+                },
+                None,
+            ),
+            (
+                {
+                    "type": "fileChange", "id": "patch", "status": "applied",
+                    "changes": [{"kind": {"type": "update"}, "path": "x.py"}],
+                },
+                "apply_patch",
+            ),
+            (
+                {
+                    "type": "mcpToolCall", "id": "mcp-ok", "server": "docs",
+                    "tool": "read", "status": "completed", "arguments": {},
+                    "result": {"ok": True}, "error": None,
+                },
+                "mcp.docs.read",
+            ),
+            (
+                {
+                    "type": "mcpToolCall", "id": "mcp-error", "server": "docs",
+                    "tool": "read", "status": "completed", "arguments": {},
+                    "result": {"ok": False, "error": "denied"}, "error": None,
+                },
+                None,
+            ),
+            (
+                {
+                    "type": "dynamicToolCall", "id": "dyn", "tool": "render",
+                    "arguments": {}, "status": "completed", "contentItems": [],
+                    "success": True,
+                },
+                "render",
+            ),
+        ],
+    )
+    def test_only_successful_completed_tools_expose_evidence(
+        self, item, expected,
+    ) -> None:
+        projection = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        )
+
+        assert projection.material_tool_name == expected
+
+
 class TestUserAndOpaqueProjection:
     def test_user_message_text_fragments_only(self) -> None:
         item = {

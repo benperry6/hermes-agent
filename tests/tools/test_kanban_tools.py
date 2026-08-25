@@ -15,6 +15,18 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+def _seed_worker_session(session_id: str, messages: list[dict]) -> None:
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        db.create_session(session_id=session_id, source="cli")
+        for message in messages:
+            db.append_message(session_id, **message)
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -62,10 +74,12 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
     return tid
 
 
@@ -113,6 +127,9 @@ def test_list_filters_tasks(monkeypatch, worker_env):
 
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
+    kt.record_worker_tool_result(
+        "read_file", json.dumps({"ok": True, "text": "verified"})
+    )
     out = kt._handle_complete({
         "summary": "got the thing done",
         "metadata": {"files": 2},
@@ -132,12 +149,161 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_rejects_tool_call_intent_without_successful_execution(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    session_id = "session-intent-only"
+    monkeypatch.setenv("HERMES_SESSION_ID", session_id)
+    _seed_worker_session(
+        session_id,
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-read",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            }
+        ],
+    )
+
+    result = json.loads(kt._handle_complete({"summary": "claimed completion"}))
+
+    assert result.get("error")
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_accepts_successful_material_result_from_current_run(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kt.record_worker_tool_result(
+        "read_file", json.dumps({"ok": True, "text": "verified"})
+    )
+    result = json.loads(kt._handle_complete({"summary": "verified work"}))
+
+    assert result.get("ok") is True
+    conn = kb.connect()
+    try:
+        events = [
+            event
+            for event in kb.list_events(conn, worker_env)
+            if event.kind == "tool_evidence"
+        ]
+        assert len(events) == 1
+        assert events[0].payload == {"tool": "read_file", "runtime": "hermes"}
+    finally:
+        conn.close()
+
+
+def test_failed_tool_result_does_not_count_as_evidence(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kt.record_worker_tool_result("read_file", json.dumps({"error": "missing"}))
+    result = json.loads(kt._handle_complete({"summary": "not actually done"}))
+
+    assert "successful material tool result" in result.get("error", "")
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_tool_evidence_is_scoped_to_current_run(worker_env):
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        current_run_id = int(os.environ["HERMES_KANBAN_RUN_ID"])
+        assert kb.record_task_tool_evidence(
+            conn,
+            worker_env,
+            tool_name="read_file",
+            runtime="hermes",
+            expected_run_id=current_run_id,
+        )
+        assert kb.task_tool_evidence(
+            conn, worker_env, expected_run_id=current_run_id + 1
+        ) == []
+    finally:
+        conn.close()
+
+
+def test_non_owner_context_cannot_record_material_evidence(
+    worker_env, monkeypatch
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: False)
+    kt.record_worker_tool_result(
+        "read_file", json.dumps({"ok": True, "text": "foreign"})
+    )
+
+    conn = kb.connect()
+    try:
+        assert kb.task_tool_evidence(
+            conn,
+            worker_env,
+            expected_run_id=int(os.environ["HERMES_KANBAN_RUN_ID"]),
+        ) == []
+    finally:
+        conn.close()
+
+
+def test_real_dispatch_boundary_records_successful_material_result(
+    worker_env, monkeypatch
+):
+    import model_tools
+    from hermes_cli import kanban_db as kb
+
+    class _Registry:
+        def get_schema(self, _tool_name):
+            return None
+
+        def dispatch(self, *_args, **_kwargs):
+            return json.dumps({"ok": True, "text": "material"})
+
+    monkeypatch.setattr(model_tools, "registry", _Registry())
+    result = model_tools.handle_function_call("read_file", {"path": "x"})
+
+    assert json.loads(result)["ok"] is True
+    conn = kb.connect()
+    try:
+        assert kb.task_tool_evidence(
+            conn,
+            worker_env,
+            expected_run_id=int(os.environ["HERMES_KANBAN_RUN_ID"]),
+        ) == ["read_file"]
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
     task. Regression for #22923."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
+
+    kt.record_worker_tool_result(
+        "read_file", json.dumps({"ok": True, "text": "verified"})
+    )
 
     # Hit the gate first.
     rejected = json.loads(kt._handle_complete({
@@ -513,6 +679,7 @@ def test_worker_lifecycle_through_tools(worker_env):
         "parents": [worker_env],
     }))
     assert child_out["ok"]
+    kt.record_worker_tool_result("kanban_create", child_out)
 
     # 5. complete with structured handoff
     comp = json.loads(kt._handle_complete({

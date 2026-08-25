@@ -1546,6 +1546,15 @@ def handle_function_call(
             middleware_trace=list(_tool_middleware_trace),
         )
 
+        # Only a result returned by the real dispatch boundary can satisfy a
+        # Kanban worker's completion gate. The recorder is a no-op elsewhere.
+        try:
+            from tools.kanban_tools import record_worker_tool_result
+
+            record_worker_tool_result(function_name, result)
+        except Exception:
+            logger.debug("kanban worker evidence recording failed", exc_info=True)
+
         # Generic tool-result canonicalization seam: plugins receive the
         # final result string (JSON, usually) and may replace it by
         # returning a string from transform_tool_result. Runs after
