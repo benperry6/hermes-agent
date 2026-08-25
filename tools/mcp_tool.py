@@ -2396,6 +2396,7 @@ class MCPServerTask:
         "_reconnect_retries", "_session_proven", "_was_parked",
         "_inflight_tasks", "_reconnecting", "_suspect_reason",
         "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
+        "_session_generation",
     )
 
     def __init__(self, name: str):
@@ -2494,12 +2495,17 @@ class MCPServerTask:
         # back to ``list_tools`` (the pre-ping probe) so we neither spam pings
         # nor reconnect-loop. Reset on each fresh transport connection.
         self._ping_unsupported: bool = False
+        # Bumped when a session is adopted or torn down. Teardown is not
+        # serialized by ``_rpc_lock``, so a non-None ``ClientSession`` can
+        # remain assigned after its transport has started closing. Dynamic
+        # refresh binds to this generation, not the pointer alone.
+        self._session_generation: int = 0
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
 
-    def _advertises_tools(self) -> bool:
+    def _advertises_tools(self, init_result: Optional[Any] = None) -> bool:
         """Whether the server advertises the ``tools`` capability.
 
         Per the MCP spec, ``InitializeResult.capabilities.tools`` is non-None
@@ -2512,8 +2518,12 @@ class MCPServerTask:
         Returns True when no capability info was captured (legacy fallback:
         preserve the old always-call-list_tools behavior rather than regress
         any server that was working before this gate).
+
+        Pass ``init_result`` to evaluate a locked generation snapshot rather
+        than whatever ``self.initialize_result`` is now.
         """
-        init_result = self.initialize_result
+        if init_result is None:
+            init_result = self.initialize_result
         caps = getattr(init_result, "capabilities", None) if init_result is not None else None
         if caps is None:
             return True
@@ -2645,7 +2655,27 @@ class MCPServerTask:
     def _mark_stdio_recycled(self, reason: str) -> None:
         """Mark a stdio session dormant before its transport finishes closing."""
         self._recycled_reason = reason
+        self._invalidate_session_generation()
         self.session = None
+
+    def _invalidate_session_generation(self) -> None:
+        """Mark the current session generation dead for in-flight refreshes."""
+        self._session_generation += 1
+
+    def _adopt_session(self, session) -> None:
+        """Install a live session and start a new refresh generation."""
+        self.session = session
+        self._session_generation += 1
+
+    def _refresh_generation_stale(self, generation: int, session) -> bool:
+        """True when the snapshotted refresh generation is no longer current."""
+        return (
+            self._session_generation != generation
+            or self.session is not session
+            or self.session is None
+            or self._shutdown_event.is_set()
+            or self._recycled_reason is not None
+        )
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
@@ -2760,21 +2790,47 @@ class MCPServerTask:
         """
         from tools.registry import registry
 
-        if not self._advertises_tools():
-            # A server that doesn't implement tools/* should never send
-            # tools/list_changed, but guard anyway — calling tools/list
-            # would raise MCPError(-32601).
-            return
-
         async with self._refresh_lock:
             # Capture old tool names for change diff
             old_tool_names = set(self._registered_tool_names)
 
-            # 1. Fetch current tool list from server (follow nextCursor)
+            # Resolve the current generation only after entering the RPC lock.
+            # A queued refresh may otherwise query a stale or dying transport.
             async with self._rpc_lock:
-                new_mcp_tools = await _paginate_full_list(
-                    self.session.list_tools, "tools", self.name
+                session = self.session
+                generation = self._session_generation
+                init_result = self.initialize_result
+                if session is None:
+                    logger.debug(
+                        "MCP server '%s': skipping dynamic tool refresh; session is closed",
+                        self.name,
+                    )
+                    return
+                if not self._advertises_tools(init_result):
+                    return
+                try:
+                    new_mcp_tools = await _paginate_full_list(
+                        session.list_tools, "tools", self.name
+                    )
+                except Exception as exc:
+                    if (
+                        _is_session_expired_error(exc)
+                        and self._refresh_generation_stale(generation, session)
+                    ):
+                        logger.debug(
+                            "MCP server '%s': skipping dynamic tool refresh; "
+                            "session transport closed during teardown",
+                            self.name,
+                        )
+                        return
+                    raise
+
+            if self._refresh_generation_stale(generation, session):
+                logger.debug(
+                    "MCP server '%s': discarding tool refresh from superseded session",
+                    self.name,
                 )
+                return
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
             # all names: live agent turns may already have tool-call IDs
@@ -3119,11 +3175,13 @@ class MCPServerTask:
 
         if self._shutdown_event.is_set():
             self._fail_inflight_calls("shutdown")
+            self._invalidate_session_generation()
             return "shutdown"
         # Deliberate teardown: fail any in-flight RPC NOW so it doesn't ride
         # the dying transport to the full tool timeout (#48069/#81995).
         self._fail_inflight_calls("reconnect")
         self._reconnect_event.clear()
+        self._invalidate_session_generation()
         return "reconnect"
 
     async def _wait_for_reconnect_or_shutdown(
@@ -3331,7 +3389,7 @@ class MCPServerTask:
                     self.initialize_result = await self._negotiate_session(
                         session, connect_timeout
                     )
-                    self.session = session
+                    self._adopt_session(session)
                     self._mark_lifecycle_started()
                     await self._discover_tools()
                     self._ready.set()
@@ -3703,7 +3761,7 @@ class MCPServerTask:
                         self.initialize_result = await self._negotiate_session(
                             session, float(connect_timeout)
                         )
-                        self.session = session
+                        self._adopt_session(session)
                         await self._discover_tools()
                         self._ready.set()
                         # Session is live again: clear any breaker state from a
@@ -3768,7 +3826,7 @@ class MCPServerTask:
                             self.initialize_result = await self._negotiate_session(
                                 session, float(connect_timeout)
                             )
-                            self.session = session
+                            self._adopt_session(session)
                             await self._discover_tools()
                             self._ready.set()
                             # Session is live again: clear any breaker state from
@@ -3815,7 +3873,7 @@ class MCPServerTask:
                         self.initialize_result = await self._negotiate_session(
                             session, float(connect_timeout)
                         )
-                        self.session = session
+                        self._adopt_session(session)
                         await self._discover_tools()
                         self._ready.set()
                         # Session is live again: clear any breaker state from a
@@ -4347,6 +4405,7 @@ class MCPServerTask:
                 if self._shutdown_event.is_set():
                     return
             finally:
+                self._invalidate_session_generation()
                 self.session = None
                 # Children of this transport are gone (or about to be);
                 # stale PIDs must never fast-fail the NEXT transport's calls.
@@ -4373,6 +4432,7 @@ class MCPServerTask:
 
     async def shutdown(self):
         """Signal the Task to exit and wait for clean resource teardown."""
+        self._invalidate_session_generation()
         self._shutdown_event.set()
         # Defensive: if _wait_for_lifecycle_event is blocking, we need ANY
         # event to unblock it. _shutdown_event alone is sufficient (the
