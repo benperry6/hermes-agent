@@ -11,6 +11,7 @@ All run zero LLM calls.
 import inspect
 import json
 import time
+from typing import Any
 
 import pytest
 
@@ -63,6 +64,121 @@ def _seed_modpack_sessions(db):
     db._conn.commit()
 
 
+def _seed_telegram_scope_sessions(db):
+    sessions = {
+        "s_current": "telegram:chat-1:topic-7",
+        "s_same": "telegram:chat-1:topic-7",
+        "s_other_topic": "telegram:chat-1:topic-8",
+        "s_other_chat": "telegram:chat-2:topic-7",
+    }
+    for session_id, session_key in sessions.items():
+        db.create_session(
+            session_id,
+            source="telegram",
+            session_key=session_key,
+        )
+        db.append_message(
+            session_id,
+            role="user",
+            content=f"telegram scopeprobe {session_id}",
+        )
+    db._conn.commit()
+
+
+def _telegram_scope_kwargs() -> dict[str, Any]:
+    return {
+        "current_session_id": "s_current",
+        "current_platform": "telegram",
+        "current_session_key": "telegram:chat-1:topic-7",
+    }
+
+
+class TestTelegramConversationScope:
+    def test_discovery_stays_in_current_topic(self, db):
+        _seed_telegram_scope_sessions(db)
+
+        result = json.loads(
+            session_search(query="scopeprobe", db=db, **_telegram_scope_kwargs())
+        )
+
+        assert [row["session_id"] for row in result["results"]] == ["s_same"]
+
+    def test_browse_stays_in_current_topic(self, db):
+        _seed_telegram_scope_sessions(db)
+
+        result = json.loads(session_search(db=db, **_telegram_scope_kwargs()))
+
+        assert [row["session_id"] for row in result["results"]] == ["s_same"]
+
+    def test_read_rejects_other_topic(self, db):
+        _seed_telegram_scope_sessions(db)
+
+        result = json.loads(
+            session_search(
+                session_id="s_other_topic",
+                db=db,
+                **_telegram_scope_kwargs(),
+            )
+        )
+
+        assert result["success"] is False
+        assert "scope" in result["error"].lower()
+
+    def test_scroll_rejects_other_topic(self, db):
+        _seed_telegram_scope_sessions(db)
+        anchor = db.get_messages("s_other_topic")[0]["id"]
+
+        result = json.loads(
+            session_search(
+                session_id="s_other_topic",
+                around_message_id=anchor,
+                db=db,
+                **_telegram_scope_kwargs(),
+            )
+        )
+
+        assert result["success"] is False
+        assert "scope" in result["error"].lower()
+
+    def test_scope_all_restores_global_access(self, db):
+        _seed_telegram_scope_sessions(db)
+        kwargs = _telegram_scope_kwargs()
+        kwargs["scope"] = "all"
+
+        result = json.loads(
+            session_search(session_id="s_other_chat", db=db, **kwargs)
+        )
+
+        assert result["success"] is True
+
+    def test_missing_current_session_fails_closed(self, db):
+        result = json.loads(
+            session_search(
+                db=db,
+                current_session_id="missing",
+                current_platform="telegram",
+            )
+        )
+
+        assert result["success"] is False
+        assert "current session" in result["error"].lower()
+
+    def test_non_telegram_default_remains_global(self, db):
+        _seed_telegram_scope_sessions(db)
+
+        result = json.loads(
+            session_search(
+                session_id="s_other_chat",
+                db=db,
+                current_session_id="s_current",
+                current_platform="cli",
+                current_session_key="telegram:chat-1:topic-7",
+            )
+        )
+
+        assert result["success"] is True
+
+
 # =========================================================================
 # Schema invariants
 # =========================================================================
@@ -82,6 +198,7 @@ class TestSchema:
         assert "window" in params
         # Shared
         assert "role_filter" in params
+        assert params["scope"]["enum"] == ["current", "all"]
         # Mode is inferred from which args are set — no explicit mode param
         assert "mode" not in params
 
@@ -99,7 +216,13 @@ class TestSchema:
             "sort",
             "profile",
         ]
-        assert parameters == [*historical_prefix, "detail"]
+        assert parameters == [
+            *historical_prefix,
+            "detail",
+            "scope",
+            "current_platform",
+            "current_session_key",
+        ]
 
 
 class TestFormatTimestamp:
