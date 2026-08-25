@@ -10724,6 +10724,7 @@ def _default_spawn(
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
+    import secrets
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
@@ -10762,6 +10763,13 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    # One-shot native launch proof paired with the hidden CLI argument below.
+    # A fresh unpredictable value prevents accidental/passive inheritance from
+    # being reconstructed from the public task id. This is not authentication
+    # against a malicious same-user process that can inspect launch state.
+    from agent.delegation_context import KANBAN_WORKER_LAUNCH_MARKER
+    worker_launch_proof = secrets.token_urlsafe(32)
+    env[KANBAN_WORKER_LAUNCH_MARKER] = worker_launch_proof
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
@@ -10875,6 +10883,7 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        "--kanban-worker-launch", worker_launch_proof,
         "-q", prompt,
     ])
     if task.goal_mode:
