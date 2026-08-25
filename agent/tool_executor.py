@@ -32,6 +32,10 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.external_delivery import (
+    TERMINAL_RESULT_METADATA_KEY,
+    capture_terminal_result_metadata,
+)
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
@@ -1809,6 +1813,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
+        _terminal_result_metadata = capture_terminal_result_metadata(
+            name,
+            function_result,
+        )
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -1842,6 +1850,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_call_id,
             effect_disposition=effect_disposition,
         )
+        if _terminal_result_metadata is not None:
+            tool_message[TERMINAL_RESULT_METADATA_KEY] = _terminal_result_metadata
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -2747,6 +2757,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
+        _terminal_result_metadata = capture_terminal_result_metadata(
+            function_name,
+            function_result,
+        )
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,
@@ -2773,6 +2787,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call_id,
             effect_disposition="unknown" if _execution_timed_out else None,
         )
+        if _terminal_result_metadata is not None:
+            tool_message[TERMINAL_RESULT_METADATA_KEY] = _terminal_result_metadata
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(

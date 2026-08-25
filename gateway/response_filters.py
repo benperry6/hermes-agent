@@ -117,6 +117,14 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
         return False
     if agent_result.get("failed"):
         return False
+    if agent_result.get("delivery_already_sent") is True:
+        receipts = agent_result.get("external_deliveries")
+        return (
+            agent_result.get("turn_exit_reason") == "external_delivery_complete"
+            and agent_result.get("completed") is True
+            and isinstance(receipts, list)
+            and bool(receipts)
+        )
     return is_intentional_silence_response(response)
 
 
