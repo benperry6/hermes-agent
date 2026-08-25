@@ -7463,6 +7463,39 @@ def run_conversation(
                     failed = True
                     break
 
+                # A deterministic foreground terminal workflow may have
+                # delivered the complete user-visible response itself. Its
+                # receipt is a control side channel, not model-visible stdout.
+                # Consume it only after the complete tool batch is canonical.
+                try:
+                    from agent.external_delivery import consume_external_delivery_receipts
+
+                    _external_delivery_receipts = consume_external_delivery_receipts(
+                        session_id=agent.session_id or "",
+                        turn_id=turn_id,
+                        tool_calls=assistant_message.tool_calls,
+                        messages=messages,
+                    )
+                except Exception:
+                    logger.warning(
+                        "external delivery receipt consumption failed",
+                        exc_info=True,
+                    )
+                    _external_delivery_receipts = []
+                if _external_delivery_receipts and len(assistant_message.tool_calls) == 1:
+                    agent._turn_external_delivery_receipts = _external_delivery_receipts
+                    _turn_exit_reason = "external_delivery_complete"
+                    final_response = "NO_REPLY"
+                    append_message(
+                        messages,
+                        {
+                            "role": "assistant",
+                            "content": final_response,
+                            "finish_reason": "external_delivery_complete",
+                        },
+                    )
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

@@ -146,6 +146,14 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    _external_delivery_receipts = list(
+        getattr(agent, "_turn_external_delivery_receipts", None) or []
+    )
+    _external_delivery_complete = (
+        str(_turn_exit_reason) == "external_delivery_complete"
+        and bool(_external_delivery_receipts)
+    )
+
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -227,7 +235,10 @@ def finalize_turn(
             )
 
     # Determine if conversation completed successfully
-    normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    normal_text_response = (
+        str(_turn_exit_reason).startswith("text_response(")
+        or _external_delivery_complete
+    )
     completed = (
         final_response is not None
         and not failed
@@ -530,7 +541,7 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _external_delivery_complete:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -556,7 +567,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not _external_delivery_complete:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -605,7 +616,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _external_delivery_complete:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -628,7 +639,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _external_delivery_complete:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -745,6 +756,9 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if _external_delivery_complete:
+        result["delivery_already_sent"] = True
+        result["external_deliveries"] = _external_delivery_receipts
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
@@ -794,13 +808,16 @@ def finalize_turn(
         _should_review_skills = True
         agent._iters_since_skill = 0
 
-    # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    # A terminal-owned external delivery already persisted its structured
+    # receipt. ``final_response`` is a NO_REPLY control token, not assistant
+    # content suitable for an external memory provider.
+    if not _external_delivery_complete:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
@@ -810,6 +827,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and not _external_delivery_complete
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):

@@ -2818,6 +2818,8 @@ def terminal_tool(
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
@@ -2833,6 +2835,8 @@ def terminal_tool(
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
         session_id: Conversation/session identifier for durable observability
+        turn_id: Current conversation turn identifier for internal receipts
+        tool_call_id: Current tool-call identifier for internal receipts
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
@@ -3577,7 +3581,28 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    execution_command = command
+                    if (
+                        env_type == "local"
+                        and session_id
+                        and turn_id
+                        and tool_call_id
+                    ):
+                        from agent.external_delivery import (
+                            inject_external_delivery_receipt_env,
+                            prepare_external_delivery_receipt_path,
+                        )
+
+                        receipt_path = prepare_external_delivery_receipt_path(
+                            session_id,
+                            turn_id,
+                            tool_call_id,
+                        )
+                        execution_command = inject_external_delivery_receipt_env(
+                            command,
+                            receipt_path,
+                        )
+                    result = env.execute(execution_command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
@@ -4151,6 +4176,8 @@ def _handle_terminal(args, **kw):
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
+        turn_id=kw.get("turn_id"),
+        tool_call_id=kw.get("tool_call_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
