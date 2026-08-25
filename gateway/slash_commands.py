@@ -3621,6 +3621,16 @@ class GatewaySlashCommandsMixin:
                 event_message_id=event_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
+                reply_to_text=(
+                    str(getattr(event, "reply_to_text", "") or "")
+                    if source.platform == Platform.TELEGRAM
+                    else ""
+                ),
+                reply_to_is_own_message=(
+                    bool(getattr(event, "reply_to_is_own_message", False))
+                    if source.platform == Platform.TELEGRAM
+                    else False
+                ),
             )
         )
         self._background_tasks.add(_task)

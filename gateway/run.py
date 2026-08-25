@@ -22615,6 +22615,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        reply_to_text: Optional[str] = None,
+        reply_to_is_own_message: bool = False,
     ) -> None:
         """Profile-scoping wrapper around the background agent task.
 
@@ -22625,13 +22627,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt,
+                source,
+                task_id,
+                event_message_id,
+                media_urls,
+                media_types,
+                reply_to_text,
+                reply_to_is_own_message,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt,
+                source,
+                task_id,
+                event_message_id,
+                media_urls,
+                media_types,
+                reply_to_text,
+                reply_to_is_own_message,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -22677,6 +22693,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        reply_to_text: Optional[str] = None,
+        reply_to_is_own_message: bool = False,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -22740,6 +22758,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception as e:
                         logger.warning("Background task vision enrichment failed: %s", e)
+
+            reply_context = str(reply_to_text or "")
+            if reply_context:
+                reply_label = (
+                    "Replying to your previous message"
+                    if reply_to_is_own_message
+                    else "Replying to"
+                )
+                enriched_prompt = (
+                    f'[{reply_label}: "{reply_context}"]\n\n{enriched_prompt}'
+                )
 
             def run_sync():
                 agent = AIAgent(

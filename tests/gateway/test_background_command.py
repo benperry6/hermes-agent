@@ -85,6 +85,41 @@ class TestHandleBackgroundCommand:
         result = await runner._handle_background_command(event)
         assert "Usage:" in result
 
+    @pytest.mark.asyncio
+    async def test_telegram_background_forwards_complete_reply_context(self):
+        runner = _make_runner()
+        runner._run_background_task = AsyncMock(return_value=None)
+        event = _make_event(text="/background inspect this")
+        nonce = "REPLY_CONTEXT_AFTER_CHARACTER_500"
+        event.reply_to_text = "q" * 700 + nonce
+        event.reply_to_is_own_message = True
+
+        await runner._handle_background_command(event)
+        await asyncio.sleep(0)
+
+        kwargs = runner._run_background_task.await_args.kwargs
+        assert kwargs["reply_to_text"] == event.reply_to_text
+        assert nonce in kwargs["reply_to_text"]
+        assert kwargs["reply_to_is_own_message"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_telegram_background_does_not_forward_reply_context(self):
+        runner = _make_runner()
+        runner._run_background_task = AsyncMock(return_value=None)
+        event = _make_event(
+            text="/background inspect this",
+            platform=Platform.DISCORD,
+        )
+        event.reply_to_text = "discord reply context"
+        event.reply_to_is_own_message = True
+
+        await runner._handle_background_command(event)
+        await asyncio.sleep(0)
+
+        kwargs = runner._run_background_task.await_args.kwargs
+        assert kwargs["reply_to_text"] == ""
+        assert kwargs["reply_to_is_own_message"] is False
+
 
 # ---------------------------------------------------------------------------
 # _run_background_task
@@ -119,7 +154,18 @@ class TestRunBackgroundTask:
         assert "failed" in call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "").lower()
 
     @pytest.mark.asyncio
-    async def test_successful_task_sends_result(self):
+    @pytest.mark.parametrize(
+        ("reply_to_is_own_message", "reply_label"),
+        [
+            (True, "Replying to your previous message"),
+            (False, "Replying to"),
+        ],
+    )
+    async def test_successful_task_sends_result(
+        self,
+        reply_to_is_own_message,
+        reply_label,
+    ):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
         mock_adapter = AsyncMock()
@@ -154,7 +200,15 @@ class TestRunBackgroundTask:
             mock_agent_instance.run_conversation.return_value = mock_result
             MockAgent.return_value = mock_agent_instance
 
-            await runner._run_background_task("say hello", source, "bg_test")
+            nonce = "REPLY_CONTEXT_AFTER_CHARACTER_500"
+            complete_reply = "q" * 700 + nonce
+            await runner._run_background_task(
+                "say hello",
+                source,
+                "bg_test",
+                reply_to_text=complete_reply,
+                reply_to_is_own_message=reply_to_is_own_message,
+            )
 
         # Should have sent the result
         mock_adapter.send.assert_called_once()
@@ -167,6 +221,11 @@ class TestRunBackgroundTask:
         assert agent_kwargs["checkpoint_max_snapshots"] == 8
         assert agent_kwargs["checkpoint_max_total_size_mb"] == 222
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
+        run_kwargs = mock_agent_instance.run_conversation.call_args.kwargs
+        assert run_kwargs["user_message"].startswith(
+            f'[{reply_label}: "{complete_reply}"]'
+        )
+        assert nonce in run_kwargs["user_message"]
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
