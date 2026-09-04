@@ -275,8 +275,12 @@ def _discovery_entry(lineage_root: Optional[str], **fields) -> Dict[str, Any]:
 def _title_match_result(db, query: str, current_lineage_root: Optional[str]) -> Optional[Dict[str, Any]]:
     """Discovery-shaped result when the query matches a session title, else None."""
     title_query = query.strip().strip("`'\"")  # models often quote a remembered title
-    session_id = title_query and _quiet(lambda: db.resolve_session_by_title(title_query), None,
-                                        "resolve_session_by_title failed for %r", title_query)
+    # Preserve exact-title preference independently of the retired Telegram filter.
+    exact = title_query and _quiet(lambda: db.get_session_by_title(title_query), None,
+                                   "get_session_by_title failed for %r", title_query)
+    session_id = exact.get("id") if exact else title_query and _quiet(
+        lambda: db.resolve_session_by_title(title_query), None,
+        "resolve_session_by_title failed for %r", title_query)
     if not session_id:
         return None
     lineage_root = _resolve_lineage(db, session_id)

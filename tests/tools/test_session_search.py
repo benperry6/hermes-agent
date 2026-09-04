@@ -63,6 +63,24 @@ def _seed_modpack_sessions(db):
     db._conn.commit()
 
 
+def test_exact_title_wins_over_newer_suffixed_variant(db):
+    # Exact-title preference is independent of transport and survives retirement.
+    for sid, source, title, started in (
+        ("s_exact", "gui", "Quarterly Recall", 100),
+        ("s_suffix", "telegram", "Quarterly Recall #2", 200),
+    ):
+        db.create_session(sid, source=source)
+        db.append_message(sid, role="user", content="Quarterly Recall notes")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, title = ? WHERE id = ?",
+            (started, title, sid),
+        )
+    db._conn.commit()
+    result = json.loads(session_search(query="Quarterly Recall", db=db))
+    assert result["results"][0]["session_id"] == "s_exact"
+    assert result["results"][0]["title"] == "Quarterly Recall"
+
+
 # =========================================================================
 # Schema invariants
 # =========================================================================
