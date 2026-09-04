@@ -210,7 +210,7 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
                                   extra_patterns: list[str] | None = None) -> str | None:
-    """Return a short label when ``filepath`` targets a protected instruction file, else ``None``.
+    """Return the resolved display path when ``filepath`` targets a protected instruction file, else ``None``.
     Matches BOTH the normalized input and its realpath so no symlink direction escapes.
 
     Matching runs on BOTH the normalized input path and its realpath so neither a symlink pointing AT a
@@ -227,6 +227,9 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
     except (OSError, ValueError, RuntimeError):
         resolved = os.path.realpath(normalized)
+    display_path = resolved
+    if os.path.normcase(normalized) != os.path.normcase(resolved):
+        display_path = f"{normalized} -> {resolved}"
 
     # ~/.hermes itself is governed by its own guards (config.yaml hard-block,
     # mirror guard, write_approval); this gate targets PROJECT-LOCAL files only.
@@ -242,13 +245,13 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         base_lower = base.lower()
         if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
                 fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
-            return base
+            return display_path
         # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
         # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
         # would gate every write inside a checkout living under ~/.hermes.
         parts = candidate.replace("\\", "/").rstrip("/").split("/")
         if len(parts) >= 2 and parts[-2] == ".hermes":
-            return candidate
+            return display_path
     return None
 
 

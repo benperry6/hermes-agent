@@ -748,6 +748,9 @@ class TestProtectedInstructionFiles:
         res = self._write(link, "injected")
         assert res.get("error") and "BLOCKED" in res["error"]
         assert real.read_text(encoding="utf-8") == "original"
+        assert str(link) in approvals["calls"][0]["command"]
+        assert str(real.resolve()) in approvals["calls"][0]["command"]
+        assert str(real.resolve()) in approvals["calls"][0]["description"]
 
     def test_case_variant_is_gated(self, tmp_path, approvals):
         approvals["answer"] = "deny"
@@ -769,6 +772,10 @@ class TestProtectedInstructionFiles:
         approvals["answer"] = "deny"
         res = self._write(deep / "CLAUDE.md")
         assert res.get("error") and "BLOCKED" in res["error"]
+        target = (deep / "CLAUDE.md").resolve()
+        assert str(target) in approvals["calls"][0]["command"]
+        assert str(target) in approvals["calls"][0]["description"]
+        assert approvals["calls"][0]["command"] != "<write to CLAUDE.md>"
 
     def test_project_local_hermes_dir_is_gated(self, tmp_path, approvals):
         proj = tmp_path / "proj" / ".hermes"
@@ -999,7 +1006,7 @@ class TestProfileHomeExemptsHermesRoot:
         token = set_hermes_home_override(str(profile))
         try:
             assert ft._protected_instruction_reason(str(repo / ".hermes" / "config.yaml"))
-            assert ft._protected_instruction_reason(str(repo / "AGENTS.md")) == "AGENTS.md"
+            assert ft._protected_instruction_reason(str(repo / "AGENTS.md")) == str(repo / "AGENTS.md")
             target = repo / ".hermes" / "config.yaml"
             res = self._write(target, "gate: off\n")
         finally:
