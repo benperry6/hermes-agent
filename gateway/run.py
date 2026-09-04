@@ -21,6 +21,7 @@ import site
 import sys
 import signal
 import threading
+from copy import deepcopy
 import time
 import traceback
 from collections import OrderedDict
@@ -158,6 +159,24 @@ def _supported_optional_kwargs(callback: Any, kwargs: Dict[str, Any]) -> Dict[st
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
         return kwargs
     return {key: value for key, value in kwargs.items() if key in parameters}
+
+
+_BACKGROUND_PARENT_HISTORY_MAX_MESSAGES = 200
+
+
+def _bounded_background_parent_history(history: List[Dict[str, Any]], *,
+                                       max_messages: int = _BACKGROUND_PARENT_HISTORY_MAX_MESSAGES):
+    """Copy the newest parent messages without splitting a tool exchange."""
+    if max_messages <= 0 or not history:
+        return []
+    snapshot = deepcopy(list(history))
+    if len(snapshot) <= max_messages:
+        return snapshot
+    start = len(snapshot) - max_messages
+    if snapshot[start].get("role") == "tool":
+        while start < len(snapshot) and snapshot[start].get("role") == "tool":
+            start += 1
+    return snapshot[start:]
 
 
 def _gateway_session_db_inner(gateway):

@@ -184,6 +184,15 @@ class TestRunBackgroundTask:
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
+        parent_history = [
+            {"role": "user", "content": "Original parent request"},
+            {"role": "assistant", "content": "Original parent response"},
+        ]
+        runner._session_db = MagicMock()
+        runner._session_db._db = runner._session_db
+        runner._session_db.get_session.return_value = {"id": "parent-session"}
+        runner._session_db.get_compression_tip.return_value = "parent-session"
+        runner._session_db.get_messages_as_conversation.return_value = parent_history
 
         source = SessionSource(
             platform=Platform.TELEGRAM,
@@ -262,6 +271,9 @@ class TestRunBackgroundTask:
         assert agent_kwargs["parent_session_id"] == "parent-session"
         assert agent_kwargs.get("gateway_session_key") is None
         run_kwargs = mock_agent_instance.run_conversation.call_args.kwargs
+        assert run_kwargs["conversation_history"] == parent_history
+        assert run_kwargs["conversation_history"] is not parent_history
+        assert run_kwargs["conversation_history"][0] is not parent_history[0]
         assert run_kwargs["current_user_text"] == "Ok, je valide pour Amandine"
         assert run_kwargs["reply_to_text"] == complete_reply
         assert run_kwargs["internal_context"] == {
@@ -273,6 +285,10 @@ class TestRunBackgroundTask:
             "ARBITRARY CONFIGURED CHANNEL OVERRIDE"
         )
         assert run_kwargs["user_message"].endswith("Ok, je valide pour Amandine")
+        assert all(
+            message.get("content") != "Ok, je valide pour Amandine"
+            for message in run_kwargs["conversation_history"]
+        )
         assert "SECONDARY TOPIC CONTEXT\n\n[New message]" in run_kwargs["user_message"]
         assert "ARBITRARY SKILL PAYLOAD" in run_kwargs["user_message"]
         assert f'[Replying to your previous message: "{complete_reply}"]' in run_kwargs["user_message"]
@@ -326,8 +342,34 @@ class TestRunBackgroundTask:
         assert prepared_event.media_types == [media_type]
         assert prepared_event.message_type == message_type
         user_message = agent.run_conversation.call_args.kwargs["user_message"]
+        assert "conversation_history" not in agent.run_conversation.call_args.kwargs
         assert prepared_marker in user_message.lower()
         assert path in user_message
+
+    @pytest.mark.asyncio
+    async def test_missing_declared_parent_fails_instead_of_starting_fresh(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._session_db = MagicMock()
+        runner._session_db._db = runner._session_db
+        runner._session_db.get_session.return_value = None
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            await runner._run_background_task(
+                "inspect parent context",
+                _make_event().source,
+                "bg_missing_parent",
+                parent_session_id="missing-parent",
+                parent_session_key="telegram:67890",
+            )
+
+        MockAgent.assert_not_called()
+        assert "missing-parent" in adapter.send.call_args.kwargs["content"]
+        assert "not found" in adapter.send.call_args.kwargs["content"].lower()
 
     @pytest.mark.asyncio
     async def test_generic_caller_supplies_its_own_provenance(self):
@@ -337,6 +379,14 @@ class TestRunBackgroundTask:
         mock_adapter.extract_media = MagicMock(return_value=([], "done"))
         mock_adapter.extract_images = MagicMock(return_value=([], "done"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
+        runner._session_db = MagicMock()
+        runner._session_db._db = runner._session_db
+        runner._session_db.get_session.return_value = {"id": "parent-session"}
+        runner._session_db.get_compression_tip.return_value = "compression-tip"
+        runner._session_db.get_session.side_effect = lambda session_id: (
+            {"id": session_id} if session_id in {"parent-session", "compression-tip"} else None
+        )
+        runner._session_db.get_messages_as_conversation.return_value = []
         source = _make_event().source
         caller_origin = {"execution_kind": "scheduled_background"}
 
@@ -359,6 +409,9 @@ class TestRunBackgroundTask:
             "routable": False,
         }
         assert "command" not in caller_origin
+        runner._session_db.get_messages_as_conversation.assert_called_once_with(
+            "compression-tip", repair_alternation=True
+        )
 
     @pytest.mark.asyncio
     async def test_peer_record_failure_still_cleans_up_agent(self):
@@ -366,6 +419,11 @@ class TestRunBackgroundTask:
         mock_adapter = MagicMock()
         mock_adapter.send = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = mock_adapter
+        runner._session_db = MagicMock()
+        runner._session_db._db = runner._session_db
+        runner._session_db.get_session.return_value = {"id": "parent-session"}
+        runner._session_db.get_compression_tip.return_value = "parent-session"
+        runner._session_db.get_messages_as_conversation.return_value = []
         source = _make_event().source
 
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
@@ -389,6 +447,29 @@ class TestRunBackgroundTask:
         agent.shutdown_memory_provider.assert_called_once()
         agent.close.assert_called_once()
         assert "Session DB unavailable" in mock_adapter.send.call_args.kwargs["content"]
+
+
+def test_background_parent_history_bound_does_not_split_tool_pairs():
+    from gateway.run import _bounded_background_parent_history
+
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+        {"role": "assistant", "content": "recent answer"},
+        {"role": "user", "content": "recent request"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2"}]},
+        {"role": "tool", "tool_call_id": "call-2", "content": "recent result"},
+        {"role": "assistant", "content": "latest answer"},
+    ]
+
+    bounded = _bounded_background_parent_history(history, max_messages=6)
+
+    assert len(bounded) <= 6
+    assert bounded[-1]["content"] == "latest answer"
+    assert not any(message.get("tool_call_id") == "call-1" for message in bounded)
+    assert any(message.get("tool_calls") == [{"id": "call-2"}] for message in bounded)
+    assert any(message.get("tool_call_id") == "call-2" for message in bounded)
 
 
 class TestAIAgentGatewayPeerContract:
