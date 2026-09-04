@@ -58,6 +58,17 @@ class TurnResult:
     should_retire: bool = False
 
 
+def _record_kanban_projection_evidence(projection: Any) -> None:
+    tool_name = getattr(projection, "material_tool_name", None)
+    if not tool_name:
+        return
+    try:
+        from tools.kanban_tools import record_successful_worker_tool
+        record_successful_worker_tool(tool_name, runtime="codex_app_server")
+    except Exception:
+        logger.debug("codex kanban evidence recording failed", exc_info=True)
+
+
 # Some codex versions stream ``<turn_aborted>`` as raw agentMessage text when an
 # interrupt/upstream error tears the turn down without emitting turn/completed.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
@@ -429,6 +440,7 @@ class CodexAppServerSession:
         _apply_accounting_notification(result, note)
         self._track_pending_file_change(note)
         projection = projector.project(note)
+        _record_kanban_projection_evidence(projection)
         if projection.messages:
             result.projected_messages.extend(projection.messages)
         if projection.is_tool_iteration:

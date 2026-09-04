@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import time
+import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
@@ -597,6 +598,73 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
 
 
+_MATERIAL_KANBAN_TOOLS = frozenset({"kanban_create", "kanban_link"})
+
+
+def _tool_result_succeeded(result: Any) -> bool:
+    if result is None:
+        return False
+    value = result
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return bool(value.strip()) and not value.strip().lower().startswith(("error", "failed:"))
+    if isinstance(value, dict):
+        if value.get("error") or value.get("ok") is False or value.get("success") is False:
+            return False
+        if str(value.get("status") or "").lower() in {
+            "error", "failed", "failure", "cancelled", "canceled", "timeout",
+        }:
+            return False
+        for key in ("exit_code", "returncode"):
+            if key in value and value[key] not in (None, 0, "0"):
+                return False
+    return True
+
+
+def _is_material_tool(tool_name: str) -> bool:
+    name = str(tool_name or "").strip()
+    leaf = name.rsplit(".", 1)[-1]
+    return bool(name) and (not leaf.startswith("kanban_") or leaf in _MATERIAL_KANBAN_TOOLS)
+
+
+def record_successful_worker_tool(tool_name: str, *, runtime: str = "hermes") -> None:
+    if not _is_dispatcher_owned_worker():
+        return
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    name = str(tool_name or "").strip()
+    if not task_id or not _is_material_tool(name):
+        return
+    try:
+        with _board(None, quiet_close=True) as (kb, conn):
+            kb.record_task_tool_evidence(
+                conn, task_id, tool_name=name, runtime=runtime,
+                expected_run_id=_worker_run_id(task_id),
+            )
+    except Exception:
+        logger.debug("kanban worker evidence persistence failed", exc_info=True)
+
+
+def record_worker_tool_result(tool_name: str, result: Any) -> None:
+    if _is_material_tool(tool_name) and _tool_result_succeeded(result):
+        record_successful_worker_tool(str(tool_name).strip(), runtime="hermes")
+
+
+def _worker_material_tool_evidence(*, wait_seconds: float = 0.0) -> list[str]:
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_id = _worker_run_id(task_id) if task_id else None
+    if not task_id or run_id is None:
+        return []
+    with _board(None, quiet_close=True) as (kb, conn):
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        while True:
+            evidence = kb.task_tool_evidence(conn, task_id, expected_run_id=run_id)
+            if evidence or time.monotonic() >= deadline:
+                return evidence
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
 # --- Handlers ---
 
 @_kanban_handler("kanban_show")
@@ -675,6 +743,24 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        if os.environ.get("HERMES_KANBAN_TASK") == tid:
+            material_tools = _worker_material_tool_evidence(wait_seconds=1.0)
+            if not material_tools:
+                reason = "worker attempted kanban_complete without a prior successful material tool result in this run"
+                recorded = kb.record_task_protocol_violation(
+                    conn, tid, reason=reason, expected_run_id=_worker_run_id(tid),
+                    details={
+                        "worker_session_id": os.environ.get("HERMES_SESSION_ID") or None,
+                        "material_tool_results": material_tools,
+                    },
+                )
+                if not recorded:
+                    return tool_error(
+                        f"kanban_complete rejected: {reason}. Task state could not be updated because the run is no longer current."
+                    )
+                return tool_error(
+                    f"kanban_complete rejected: {reason}. The task remains in flight; do real tool work, then retry."
+                )
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,

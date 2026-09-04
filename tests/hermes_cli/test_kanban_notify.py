@@ -878,77 +878,32 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     """Missing artifact paths are silently skipped — they may have been
     referenced by name only. The notifier must not crash and must still
     deliver any artifacts that do exist."""
-    import hermes_cli.kanban_db as kb
-    from hermes_cli import kanban_db_connect as kbc
-    from hermes_cli import kanban_db_notify as kbn
     from gateway.run import GatewayRunner
-    from gateway.config import Platform
-    from tools import kanban_tools as kt
 
-    # Allow ``tmp_path`` through the media-delivery safety filter. See the
-    # companion test for the full explanation.
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
-
     real_pdf = tmp_path / "real.pdf"
     real_pdf.write_bytes(b"%PDF-fake")
 
-    conn = kbc.connect()
-    try:
-        tid = kb.create_task(conn, title="t", assignee="worker1")
-        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
-        # A dispatcher-spawned worker completes a card it holds a run on: bind the
-        # run id like the dispatcher does, or the ownership CAS refuses (#116239).
-        assert kb.claim_task(conn, tid) is not None
-        run_id = kb._current_run_id(conn, tid)
-    finally:
-        conn.close()
-
-    import os
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
-    os.environ["HERMES_KANBAN_TASK"] = tid
-    try:
-        kt._handle_complete({
-            "summary": "one real, one ghost",
-            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
-        })
-    finally:
-        os.environ.pop("HERMES_KANBAN_TASK", None)
-
     runner = object.__new__(GatewayRunner)
-    runner._owns_kanban_dispatcher_lock = lambda: True
-    runner._running = True
-    runner._kanban_sub_fail_counts = {}
-    runner._kanban_dispatcher_lock_handle = object()
-
     fake_adapter = MagicMock()
-    fake_adapter.name = "telegram"
-
     documents_uploaded: list = []
-
-    async def _send(chat_id, msg, metadata=None):
-        runner._running = False
-
     async def _send_document(chat_id, file_path, metadata=None, **_kw):
         documents_uploaded.append(file_path)
-
-    fake_adapter.send = AsyncMock(side_effect=_send)
     fake_adapter.send_document = AsyncMock(side_effect=_send_document)
     fake_adapter.send_multiple_images = AsyncMock()
     from gateway.platforms.base import BasePlatformAdapter
     fake_adapter.extract_local_files = BasePlatformAdapter.extract_local_files
 
-    runner.adapters = {Platform.TELEGRAM: fake_adapter}
-
-    _orig_sleep = asyncio.sleep
-
-    async def _fast_sleep(_):
-        await _orig_sleep(0)
-
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
-        await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
-            timeout=10.0,
-        )
+    await runner._deliver_kanban_artifacts(
+        adapter=fake_adapter,
+        chat_id="chat1",
+        metadata={},
+        event_payload={
+            "summary": "one real, one ghost",
+            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
+        },
+        task=None,
+    )
 
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1

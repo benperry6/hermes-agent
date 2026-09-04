@@ -119,6 +119,9 @@ def test_list_filters_tasks(monkeypatch, worker_env):
 
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
+    kt.record_worker_tool_result(
+        "read_file", json.dumps({"ok": True, "text": "verified"})
+    )
     out = kt._handle_complete({
         "summary": "got the thing done",
         "metadata": {"files": 2},
@@ -139,6 +142,75 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_rejects_narrative_without_current_run_material_evidence(
+    worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_complete({"summary": "narrative only"}))
+
+    assert "successful material tool result" in out.get("error", "")
+    assert "remains in flight" in out.get("error", "")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+        kinds = [event.kind for event in kb.list_events(conn, worker_env)]
+        assert "protocol_violation" in kinds
+        assert "blocked" not in kinds
+    finally:
+        conn.close()
+
+
+def test_complete_accepts_successful_material_result_from_current_run(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kt.record_worker_tool_result(
+        "read_file",
+        json.dumps({"ok": True, "text": "verified"}),
+    )
+    out = json.loads(kt._handle_complete({"summary": "verified work"}))
+
+    assert out.get("ok") is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "done"
+        evidence = [
+            event
+            for event in kb.list_events(conn, worker_env)
+            if event.kind == "tool_evidence"
+        ]
+        assert len(evidence) == 1
+        assert evidence[0].payload == {
+            "tool": "read_file",
+            "runtime": "hermes",
+        }
+    finally:
+        conn.close()
+
+
+def test_non_owner_context_cannot_record_material_evidence(
+    worker_env, monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: False)
+    kt.record_worker_tool_result(
+        "read_file", json.dumps({"ok": True, "text": "foreign context"})
+    )
+
+    conn = kb.connect()
+    try:
+        run_id = int(os.environ["HERMES_KANBAN_RUN_ID"])
+        assert kb.task_tool_evidence(
+            conn, worker_env, expected_run_id=run_id
+        ) == []
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
@@ -146,6 +218,10 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
+
+    kt.record_worker_tool_result(
+        "read_file", json.dumps({"ok": True, "text": "verified"})
+    )
 
     # Hit the gate first.
     rejected = json.loads(kt._handle_complete({
@@ -185,6 +261,7 @@ def test_complete_reports_registered_attachments(worker_env):
         kbw.set_workspace_path(conn, worker_env, ws)
     artifact = ws / "corpus.json"
     artifact.write_bytes(b"{}")
+    kt.record_worker_tool_result("read_file", json.dumps({"ok": True, "text": "verified"}))
 
     out = kt._handle_complete({
         "summary": "done",
@@ -274,6 +351,7 @@ def test_unbound_worker_cannot_mutate_card(monkeypatch, worker_env):
     with kbc.connect() as conn:
         run_id = kb.get_task(conn, worker_env).current_run_id
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    kt.record_worker_tool_result("read_file", json.dumps({"ok": True, "text": "verified"}))
     out = json.loads(kt._handle_complete({"summary": "bound worker done"}))
     assert out.get("ok") is True
     with kbc.connect() as conn:
@@ -734,6 +812,7 @@ def test_worker_lifecycle_through_tools(worker_env):
         "parents": [worker_env],
     }))
     assert child_out["ok"]
+    kt.record_worker_tool_result("kanban_create", child_out)
 
     # 5. complete with structured handoff
     comp = json.loads(kt._handle_complete({
