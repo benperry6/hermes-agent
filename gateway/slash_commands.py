@@ -822,6 +822,33 @@ class GatewaySlashCommandsMixin(
         parent_entry = await self.async_session_store.get_or_create_session(event.source)
         parent_session_id = str(getattr(parent_entry, "session_id", "") or "")
         parent_session_key = self._session_key_for_source(event.source)
+        recorded_parent_key = str(getattr(parent_entry, "session_key", "") or "")
+        if not parent_session_id or recorded_parent_key != parent_session_key:
+            logger.error(
+                "Refusing /bg parent snapshot for routing key %r: resolved session %r "
+                "belongs to %r",
+                parent_session_key,
+                parent_session_id,
+                recorded_parent_key,
+            )
+            return "❌ Background task not started: parent conversation snapshot unavailable."
+        try:
+            raw_parent_history = await self.async_session_store.load_transcript(
+                parent_session_id
+            )
+            from gateway.run import _build_gateway_agent_history
+
+            parent_conversation_history, _ = _build_gateway_agent_history(
+                raw_parent_history,
+                channel_prompt=getattr(event, "channel_prompt", None),
+            )
+        except Exception:
+            logger.error(
+                "Failed to snapshot /bg parent conversation %s",
+                parent_session_id,
+                exc_info=True,
+            )
+            return "❌ Background task not started: parent conversation snapshot could not be read."
         origin = event.source.to_dict()
         origin.update({
             "execution_kind": "user_explicit_background",
@@ -835,6 +862,7 @@ class GatewaySlashCommandsMixin(
             message_type=event.message_type,
             parent_session_id=parent_session_id,
             parent_session_key=parent_session_key,
+            parent_conversation_history=parent_conversation_history,
             reply_to_text=str(getattr(event, "reply_to_text", "") or ""),
             reply_to_is_own_message=bool(getattr(event, "reply_to_is_own_message", False)),
             auto_skill=getattr(event, "auto_skill", None),
