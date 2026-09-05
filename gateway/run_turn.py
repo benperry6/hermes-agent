@@ -2525,11 +2525,15 @@ class GatewayTurnMixin:
                 try:
                     if parent_session_id and parent_session_key:
                         agent.record_gateway_session_peer(origin=origin, routable=False)
-                    return agent.run_conversation(
-                        user_message=enriched_prompt, system_message=context_prompt, task_id=task_id,
-                        current_user_text=normalized_current_user_text,
-                        reply_to_text=reply_context, internal_context=structured_internal_context,
-                    )
+                    from gateway.run import _supported_optional_kwargs
+                    conversation_kwargs = {"task_id": task_id}
+                    conversation_kwargs.update(_supported_optional_kwargs(agent.run_conversation, {
+                        "system_message": context_prompt,
+                        "current_user_text": normalized_current_user_text,
+                        "reply_to_text": reply_context,
+                        "internal_context": structured_internal_context,
+                    }))
+                    return agent.run_conversation(user_message=enriched_prompt, **conversation_kwargs)
                 finally:
                     self._cleanup_agent_resources(agent)
 

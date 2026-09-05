@@ -819,7 +819,7 @@ class GatewaySlashCommandsMixin(
         if not prompt:
             return t("gateway.background.usage")
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
-        parent_entry = self.session_store.get_or_create_session(event.source)
+        parent_entry = await self.async_session_store.get_or_create_session(event.source)
         parent_session_id = str(getattr(parent_entry, "session_id", "") or "")
         parent_session_key = self._session_key_for_source(event.source)
         origin = event.source.to_dict()

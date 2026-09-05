@@ -47,6 +47,10 @@ def _make_runner():
     # and make the session-scoped reasoning resolver receive a MagicMock.
     mock_store.get_model_override.return_value = None
     runner.session_store = mock_store
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.get_or_create_session = AsyncMock(
+        side_effect=lambda source: runner.session_store.get_or_create_session(source)
+    )
 
     from gateway.hooks import HookRegistry
     runner.hooks = HookRegistry()
