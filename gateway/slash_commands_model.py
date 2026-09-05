@@ -739,7 +739,12 @@ class GatewayModelCommandsMixin:
             level = effort_display_label(current_effort, *_route)
         display_state = t("gateway.reasoning.display_on") if self._show_reasoning else t("gateway.reasoning.display_off")
         has_session_override = session_key in (getattr(self, "_session_reasoning_overrides", {}) or {})
-        scope = t("gateway.reasoning.scope_session") if has_session_override else t("gateway.reasoning.scope_global")
+        if has_session_override:
+            scope = t("gateway.reasoning.scope_session")
+        elif getattr(self, "_load_topic_reasoning_config")(_reasoning_source) is not None:
+            scope = t("gateway.reasoning.scope_topic")
+        else:
+            scope = t("gateway.reasoning.scope_global")
 
         async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
             return self._apply_reasoning_selection(session_key, platform_key, value)
