@@ -1697,7 +1697,13 @@ class TurnRunner:
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
-            api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
+            from gateway.session_transcript import (
+                background_context_carrier, pending_background_context, wrap_background_context,
+            )
+            background_context = pending_background_context(ctx.history)
+            native_message = self._native_image_run_message()
+            current_message = wrap_background_context(native_message, background_context)
+            api_message = _wrap_current_message_with_observed_context(current_message, observed_group_context)
             from gateway.run import _supported_optional_kwargs
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             kwargs.update(_supported_optional_kwargs(agent.run_conversation, {
@@ -1715,6 +1721,12 @@ class TurnRunner:
                 kwargs["persist_user_message"] = persist_user_message_override
             elif observed_group_context:
                 kwargs["persist_user_message"] = ctx.message
+            if background_context:
+                carrier = background_context_carrier(
+                    kwargs.get("persist_user_message", native_message), background_context)
+                kwargs["persist_user_message"] = carrier["content"]
+                kwargs["persist_user_display_kind"] = carrier["display_kind"]
+                kwargs["persist_user_display_metadata"] = carrier["display_metadata"]
             if ctx.persist_user_display_kind:
                 # Internal self-injected turn: type the persisted user row so UIs render it as a
                 # timeline notice, not a user bubble (stripped from provider payloads downstream).

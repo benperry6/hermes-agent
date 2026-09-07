@@ -814,7 +814,7 @@ class GatewaySlashCommandsMixin(
 
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /bg <prompt> — run a prompt in a background thread with its own session; the
-        result is sent to the same chat without touching the active session's history."""
+        result is sent to the same chat and recorded passively for the parent’s next turn."""
         prompt = event.get_command_args().strip()
         if not prompt:
             return t("gateway.background.usage")
@@ -849,6 +849,20 @@ class GatewaySlashCommandsMixin(
                 exc_info=True,
             )
             return "❌ Background task not started: parent conversation snapshot could not be read."
+        from gateway.session_transcript import (
+            background_context_carrier, background_context_receipt, pending_background_context,
+        )
+        pending_context = pending_background_context(raw_parent_history)
+        if pending_context:
+            # A second /bg can refer to a result received since the last foreground turn.
+            parent_conversation_history.append(background_context_carrier("", pending_context))
+        request_context = f"Task {task_id} started in a separate worker. Request: {prompt}"
+        if getattr(event, "reply_to_text", None):
+            request_context += f"\nReply context: {event.reply_to_text}"
+        if event.media_urls:
+            request_context += f"\nAttachments: {list(event.media_urls)}"
+        await self.async_session_store.append_to_transcript(
+            parent_session_id, background_context_receipt(task_id, "started", request_context))
         origin = event.source.to_dict()
         origin.update({
             "execution_kind": "user_explicit_background",

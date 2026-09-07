@@ -542,7 +542,8 @@ class GatewaySessionCommandsMixin:
             return t("gateway.compress.no_provider")
         # FULL transcript (tool results included), like auto-compress: user/assistant-only starves
         # tool-result pruning and can trip the protect-first/last early-return.
-        msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
+        from gateway.session_transcript import background_context_for_compaction
+        msgs = background_context_for_compaction(history)
         # Assign, not setdefault (a resolver value would be a stale placeholder); platform only when
         # known so None -> "cli" holds.
         if platform_key is not None:
