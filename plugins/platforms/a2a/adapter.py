@@ -539,7 +539,8 @@ class A2AAdapter(BasePlatformAdapter):
         turn = self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-        if turn > max_turns:
+        # Ben-authorized Codex continuity; peer is HTTP-authenticated, never body-supplied.
+        if peer != "codex-mac" and turn > max_turns:
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
             return self._end_task(rec, protocol.STATE_REJECTED, f"Anti-loop protection: context {context_id} exceeded "
