@@ -159,6 +159,25 @@ def run_tool_round(
         failed = True
         return _verdict("break")
 
+    try:
+        from agent.external_delivery import consume_external_delivery_receipts
+        receipts = consume_external_delivery_receipts(
+            session_id=agent.session_id or "", turn_id=getattr(agent, "_current_turn_id", "") or "",
+            tool_calls=assistant_message.tool_calls, messages=messages,
+        )
+    except Exception:
+        logger.warning("external delivery receipt consumption failed", exc_info=True)
+        receipts = []
+    if receipts and len(assistant_message.tool_calls) == 1:
+        agent._turn_external_delivery_receipts = receipts
+        _turn_exit_reason = "external_delivery_complete"
+        final_response = "NO_REPLY"
+        append_message(messages, {
+            "role": "assistant", "content": final_response,
+            "finish_reason": "external_delivery_complete",
+        })
+        return _verdict("break")
+
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
         _turn_exit_reason = "guardrail_halt"
