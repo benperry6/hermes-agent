@@ -146,6 +146,9 @@ class MCPServerRunMixin:
                     self._mark_session_proven()
         finally:
             await self._cancel_waiters(*waiters)
+        # Invalidate refreshes before the transport context starts unwinding. The
+        # session pointer can remain non-None until __aexit__ completes.
+        self._invalidate_session_generation()
         if self._shutdown_event.is_set():
             self._fail_inflight_calls("shutdown")
             return "shutdown"
@@ -525,6 +528,7 @@ class MCPServerRunMixin:
 
     async def shutdown(self):
         """Signal the Task to exit and wait for clean resource teardown."""
+        self._invalidate_session_generation()
         self._shutdown_event.set()
         # Also set reconnect: closes any race where _wait_for_lifecycle_event misses the
         # shutdown flag after returning "reconnect".
