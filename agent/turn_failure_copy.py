@@ -188,8 +188,9 @@ _AUTH_COPY: Dict[str, str] = {
 }
 
 CONTENT_POLICY_NEXT_STEPS = (
-    "Try rewording your message or removing sensitive attachments, or switch to another "
-    "model with /model."
+    "If this authorized request was blocked incorrectly, contact the provider through its "
+    "official review/support process with the non-secret request identifiers. "
+    "Do not switch provider, model, credentials, or session to bypass this refusal."
 )
 
 # ---- one reason → "what happened" gloss, shared by cron, subagent and chat notices ------------

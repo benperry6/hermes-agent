@@ -343,7 +343,7 @@ _PROVIDER_POLICY_BLOCKED_PATTERNS = (
 )
 
 # Per-prompt safety-filter blocks: deterministic for the unchanged request, so
-# fallback immediately. Each phrase is verbatim from one provider (Codex cyber
+# stop without retry or fallback. Each phrase is verbatim from one provider (Codex cyber
 # flags #18028, OpenAI moderation, Anthropic safety, Azure token, MiniMax
 # #32421, CommandCode gateway moderation #115218) — never a generic word like
 # "policy" that collides with billing/auth.
@@ -352,6 +352,7 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = (
     "flagged for possible cybersecurity risk", "trusted access for cyber",
     "violates our usage policies", "violates openai's usage policies", "your request was flagged by",
     "prompt was flagged by our safety", "responses cannot be generated due to safety",
+    "this request was blocked by our safety systems",
     "content_filter", "responsibleaipolicyviolation", "new_sensitive",
     "content exists risk",
 )
@@ -458,7 +459,7 @@ _V_AUTH_ROTATE = _v(_R.auth, retryable=False, **_ROTATE_FALLBACK)
 _V_AUTH_FALLBACK = _v(_R.auth, **_ABORT_FALLBACK)
 _V_MODEL_NOT_FOUND = _v(_R.model_not_found, **_ABORT_FALLBACK)
 _V_UPSTREAM_BLOCKED = _v(_R.upstream_blocked, **_ABORT_FALLBACK)
-_V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, **_ABORT_FALLBACK)
+_V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, retryable=False)
 # Another account in the same pool may hold the entitlement; the credential itself is healthy.
 _V_MODEL_ENTITLEMENT = _v(_R.model_entitlement, retryable=False, **_ROTATE_FALLBACK)
 _V_FORMAT_ERROR = _v(_R.format_error, **_ABORT_FALLBACK)

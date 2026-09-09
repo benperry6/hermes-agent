@@ -939,13 +939,12 @@ def nonretryable_client_error_result(
             "      set `extra_headers: {User-Agent: HermesAgent/1.0}` on the custom_providers entry,",
             "      or check the proxy/WAF rules and your network.",
         )
-    # Content-policy blocks: the provider refused this prompt, so recovery is a rephrase
-    # or another model, not key/retry advice.
+    # Content-policy blocks require the provider's official review, not a route change.
     if classified.reason == FailoverReason.content_policy_blocked:
         _vlines(
             agent,
-            f"   💡 {CONTENT_POLICY_NEXT_STEPS}",
-            "      To route future blocks to another provider automatically: hermes fallback add",
+            "   💡 The provider's safety filter rejected this specific prompt.",
+            f"      • {CONTENT_POLICY_NEXT_STEPS}",
         )
     # TLS certificate failures are environment problems — name the knobs for each cause.
     if classified.reason == FailoverReason.ssl_cert_verification:
@@ -974,6 +973,7 @@ def nonretryable_client_error_result(
             messages, api_call_count,
             final_response="⚠️ " + content_policy_copy(label=_plabel, summary=_nonretryable_summary),
             error_detail=_nonretryable_summary,
+            provider_response=api_error,
         )
     # Billing walls get the same structured recovery descriptor as the max-retries path
     # so every surface renders one consistent signal.

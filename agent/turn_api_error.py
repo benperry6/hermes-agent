@@ -77,13 +77,6 @@ def handle_api_error(
     if agent.thinking_callback:
         agent.thinking_callback("")
 
-    _recovered, active_system_prompt = recover_before_classification(
-        agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
-        active_system_prompt=active_system_prompt,
-    )
-    if _recovered:
-        return _verdict("continue")
-
     status_code = getattr(api_error, "status_code", None)
     error_context = agent._extract_api_error_context(api_error)
 
@@ -126,6 +119,22 @@ def handle_api_error(
         retry_count=retry_count, max_retries=max_retries, retryable=classified.retryable,
         reason=classified.reason.value,
     )
+
+    # Safety refusals are terminal before any repair, credential rotation or fallback.
+    if classified.reason == FailoverReason.content_policy_blocked:
+        return _verdict("return", nonretryable_client_error_result(
+            agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
+            api_messages=api_messages, messages=messages, conversation_history=conversation_history,
+            api_call_count=api_call_count, approx_tokens=approx_tokens,
+            provider=agent.provider, base_url=agent.base_url, model=agent.model,
+        ))
+
+    _recovered, active_system_prompt = recover_before_classification(
+        agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
+        active_system_prompt=active_system_prompt,
+    )
+    if _recovered:
+        return _verdict("continue")
 
     _recovered, recovered_with_pool = recover_after_classification(
         agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,

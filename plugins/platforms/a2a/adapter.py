@@ -832,8 +832,11 @@ class A2AAdapter(BasePlatformAdapter):
         the caller; progress/status/preview sends must not."""
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
-        elif not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
-            logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
+        else:
+            state = protocol.STATE_FAILED if (metadata or {}).get("processing_error") is not None else protocol.STATE_COMPLETED
+            # The final reply's runner-owned outcome, not error-looking prose, is authoritative.
+            if not self._resolve_oldest_for_context(chat_id, state, content or ""):
+                logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:

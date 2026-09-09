@@ -616,9 +616,10 @@ def handle_content_policy_refusal(
     api_request_id: Any, api_start_time: float, retry_count: int, max_retries: int,
 ) -> RefusalVerdict:
     """HTTP-200 refusal (``finish_reason`` ``content_filter`` / ``guardrail_intervened``).
-    Deterministic for the unchanged prompt — never retried: one configured-fallback try,
-    else surface the refusal (explanation may live only in the reasoning channel)."""
-    from agent.conversation_loop import _arm_fallback_restart, _content_policy_blocked_result
+    Terminal without retry or fallback; surface the refusal and official review guidance."""
+    from agent.conversation_loop import (
+        _CONTENT_POLICY_RECOVERY_HINT, _content_policy_blocked_result
+    )
 
     _refusal_result = normalize_response_for_agent(agent, response)
     _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
@@ -642,11 +643,6 @@ def handle_content_policy_refusal(
     )
     stop_thinking_spinner(agent, thinking_spinner)
 
-    if agent._has_pending_fallback():
-        agent._buffer_diagnostic_status("⚠️ Model declined to respond (safety refusal) — trying fallback...")
-    if agent._try_activate_fallback():
-        active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
-        return RefusalVerdict("break", None, active_system_prompt)
 
     agent._flush_status_buffer()
     _refusal_log = _refusal_text[:500] + "..." if len(_refusal_text) > 500 else _refusal_text
@@ -669,4 +665,5 @@ def handle_content_policy_refusal(
     return RefusalVerdict("return", _content_policy_blocked_result(
         messages, api_call_count, final_response=_refusal_response,
         error_detail=_refusal_text or "model declined (content_filter)",
+        provider_response=response,
     ), active_system_prompt)
