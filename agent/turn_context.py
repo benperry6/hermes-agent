@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from agent.conversation_compression import recover_rotated_compression_session
@@ -449,6 +449,9 @@ class TurnContext:
     effective_task_id: str
     turn_id: str
     current_turn_user_idx: int  # index of the current user turn within ``messages``
+    current_user_text: Optional[str] = None
+    reply_to_text: Optional[str] = None
+    internal_context: Dict[str, Any] = field(default_factory=dict)
     should_review_memory: bool = False  # post-turn memory review should fire
     plugin_user_context: str = ""  # ``pre_llm_call`` context (appended to user message)
     ext_prefetch_cache: str = ""  # external-memory prefetch, reused across iterations
@@ -730,6 +733,8 @@ def _ensure_session_row(agent: Any, pending_cli_message: Any) -> None:
 def _collect_pre_llm_call_context(
     agent: Any, *, effective_task_id: str, turn_id: str, original_user_message: Any,
     messages: List[Any], conversation_history: Optional[List[Any]],
+    current_user_text: Optional[str] = None, reply_to_text: Optional[str] = None,
+    internal_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Run ``pre_llm_call`` plugins; their context is injected into the user message
     (never the system prompt). Oversized per-hook context is spilled to disk so a
@@ -744,6 +749,11 @@ def _collect_pre_llm_call_context(
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,
+            current_user_text=(
+                original_user_message if current_user_text is None else current_user_text
+            ),
+            reply_to_text=reply_to_text or "",
+            internal_context=dict(internal_context or {}),
             conversation_history=list(messages),
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
@@ -927,6 +937,8 @@ def build_turn_context(
     persist_user_message: Optional[Any], persist_user_timestamp: Optional[float]=None,
     persist_user_platform_id: Optional[str]=None, *, persist_user_display_kind: Optional[str]=None,
     persist_user_display_metadata: Optional[Dict[str, Any]]=None, turn_author: Optional[Dict[str, Any]]=None,
+    current_user_text: Optional[str]=None, reply_to_text: Optional[str]=None,
+    internal_context: Optional[Dict[str, Any]]=None,
     restore_or_build_system_prompt,
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
@@ -1058,7 +1070,8 @@ def build_turn_context(
     plugin_user_context = _collect_pre_llm_call_context(
         agent, effective_task_id=effective_task_id, turn_id=turn_id,
         original_user_message=original_user_message, messages=messages,
-        conversation_history=conversation_history,
+        conversation_history=conversation_history, current_user_text=current_user_text,
+        reply_to_text=reply_to_text, internal_context=internal_context,
     )
     plugin_user_context = _merge_gateway_notes(
         agent, messages, current_turn_user_idx, plugin_user_context
@@ -1090,6 +1103,8 @@ def build_turn_context(
         conversation_history=conversation_history, active_system_prompt=active_system_prompt,
         effective_task_id=effective_task_id, turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx, should_review_memory=should_review_memory,
+        current_user_text=current_user_text, reply_to_text=reply_to_text,
+        internal_context=dict(internal_context or {}),
         plugin_user_context=plugin_user_context, ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=compaction.blocked,
     )

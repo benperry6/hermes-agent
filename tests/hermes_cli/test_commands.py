@@ -154,9 +154,9 @@ class TestGatewayHelpLines:
         joined = "\n".join(lines)
         assert "`/bg" in joined
         assert "`/btw" in joined
-        # The retired /background canonical name must be gone.
-        bg_line = [l for l in lines if "/background" in l]
-        assert not bg_line
+        background_alias_lines = [line for line in lines if "/background" in line]
+        assert len(background_alias_lines) == 1
+        assert background_alias_lines[0].startswith("`/bg <prompt>`")
 
 
 class TestTelegramBotCommands:

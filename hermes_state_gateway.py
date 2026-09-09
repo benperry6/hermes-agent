@@ -51,11 +51,13 @@ _PEER_SELECT_HEAD = """
 """
 _PEER_BY_KEY_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.session_key = ?
                   AND s.source = ?
+                  AND COALESCE({_sql_json_extract('s.origin_json', '$._gateway_routable')}, 1) != 0
                   AND (s.ended_at IS NULL OR s.end_reason IN ({_RECOVERABLE_END_REASONS_SQL}))
                   AND NOT EXISTS (
                       SELECT 1 FROM sessions b
                       WHERE b.session_key = s.session_key
                         AND b.source = s.source
+                        AND COALESCE({_sql_json_extract('b.origin_json', '$._gateway_routable')}, 1) != 0
                         AND b.ended_at IS NOT NULL
                         AND b.end_reason IN ({_RESET_END_REASONS_SQL})
                         AND b.ended_at
@@ -66,6 +68,7 @@ _PEER_BY_KEY_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.session_key = 
                 LIMIT 1
                 """
 _PEER_BY_TUPLE_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.source = ?
+                  AND COALESCE({_sql_json_extract('s.origin_json', '$._gateway_routable')}, 1) != 0
                   AND COALESCE(s.user_id, '') = COALESCE(?, '')
                   AND COALESCE(s.chat_id, '') = COALESCE(?, '')
                   AND COALESCE(s.chat_type, '') = COALESCE(?, '')
@@ -78,6 +81,7 @@ _PEER_BY_TUPLE_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.source = ?
                   AND NOT EXISTS (
                       SELECT 1 FROM sessions b
                       WHERE b.source = s.source
+                        AND COALESCE({_sql_json_extract('b.origin_json', '$._gateway_routable')}, 1) != 0
                         AND COALESCE(b.user_id, '') = COALESCE(s.user_id, '')
                         AND COALESCE(b.chat_id, '') = COALESCE(s.chat_id, '')
                         AND COALESCE(b.chat_type, '') = COALESCE(s.chat_type, '')
@@ -106,6 +110,7 @@ _ORPHANS_SQL = f"""
                   AND EXISTS (SELECT 1 FROM messages m
                                WHERE m.session_id = o.id)
                   AND COALESCE(o.source, '') != 'tool'
+                  AND COALESCE({_sql_json_extract('o.origin_json', '$._gateway_routable')}, 1) != 0
                   AND {_sql_json_extract('o.model_config', '$._branched_from')} IS NULL
                   AND {_sql_json_extract('o.model_config', '$._delegate_from')} IS NULL
                 ORDER BY o.started_at ASC
@@ -217,7 +222,7 @@ class SessionGatewayMixin:
         self, session_id: str, *, source: str, user_id: str = None, session_key: str = None,
         chat_id: str = None, chat_type: str = None, thread_id: str = None, display_name: str = None,
         origin_json: str = None, include_compression_ancestors: bool = False,
-        transport_profile: str = None) -> None:
+        transport_profile: str = None, routable: bool = True) -> None:
         """Persist the gateway routing peer for an existing session row. ``display_name`` / ``origin_json``:
         ``None`` leaves the stored value untouched (consumers read routing data from state.db, not
         sessions.json). ``include_compression_ancestors`` keeps a compression lineage on one routing peer
@@ -229,8 +234,19 @@ class SessionGatewayMixin:
 
         See #9006.
         """
-        if not session_id or not session_key:
+        if not session_id or (routable and not session_key):
             return
+
+        if not routable:
+            try:
+                origin = json.loads(origin_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                origin = {}
+            if not isinstance(origin, dict):
+                origin = {}
+            origin["_gateway_routable"] = False
+            origin_json = json.dumps(origin, sort_keys=True)
+            session_key = None
         identity = (
             session_key, source, user_id, chat_id, chat_type, thread_id, display_name, origin_json,
             transport_profile)

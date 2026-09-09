@@ -819,10 +819,32 @@ class GatewaySlashCommandsMixin(
         if not prompt:
             return t("gateway.background.usage")
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        parent_entry = self.session_store.get_or_create_session(event.source)
+        parent_session_id = str(getattr(parent_entry, "session_id", "") or "")
+        parent_session_key = self._session_key_for_source(event.source)
+        origin = event.source.to_dict()
+        origin.update({
+            "execution_kind": "user_explicit_background",
+            "user_initiated": True,
+            "command": "/bg",
+        })
         self._track_background_task(self._run_background_task(
             prompt, event.source, task_id, event_message_id=self._reply_anchor_for_event(event),
             # Forward image/audio attachments so the background agent can see them.
-            media_urls=list(event.media_urls or []), media_types=list(event.media_types or [])))
+            media_urls=list(event.media_urls or []), media_types=list(event.media_types or []),
+            message_type=event.message_type,
+            parent_session_id=parent_session_id,
+            parent_session_key=parent_session_key,
+            reply_to_text=str(getattr(event, "reply_to_text", "") or ""),
+            reply_to_is_own_message=bool(getattr(event, "reply_to_is_own_message", False)),
+            auto_skill=getattr(event, "auto_skill", None),
+            channel_prompt=getattr(event, "channel_prompt", None),
+            internal_context=(
+                {"channel_context": event.channel_context}
+                if getattr(event, "channel_context", None) else {}
+            ),
+            origin=origin,
+        ))
         return t("gateway.background.started", preview=_preview(prompt), task_id=task_id)
 
     async def _handle_btw_command(self, event: MessageEvent) -> str:

@@ -447,7 +447,8 @@ def _apply_output_hooks(
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
-    _turn_exit_reason, _pending_verification_response=None,
+    _turn_exit_reason, current_user_text=None, reply_to_text=None, internal_context=None,
+    _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
@@ -668,6 +669,9 @@ def finalize_turn(
             session_id=agent.session_id,
             task_id=effective_task_id,
             turn_id=turn_id,
+            current_user_text=(original_user_message if current_user_text is None else current_user_text),
+            reply_to_text=reply_to_text or "",
+            internal_context=dict(internal_context or {}),
             completed=completed,
             failed=failed,
             interrupted=interrupted,
@@ -675,6 +679,7 @@ def finalize_turn(
             model=agent.model,
             platform=_platform,
         )
+
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

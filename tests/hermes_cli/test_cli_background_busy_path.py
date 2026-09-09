@@ -82,12 +82,12 @@ class TestBackgroundInlineDetector:
         assert cli._should_handle_background_command_inline("/btw do work") is True
 
     def test_background_alias_still_resolves_to_bg(self):
-        """The retired /background spelling no longer resolves to a command."""
+        """The historical /background spelling shares /bg's busy path."""
         cli = _make_cli()
         cli._agent_running = True
         assert cli._should_handle_background_command_inline(
             "/background do work"
-        ) is False
+        ) is True
 
     def test_ignores_background_when_agent_idle(self):
         """Idle input falls through to the normal process_loop dispatch."""
@@ -134,7 +134,7 @@ class TestBackgroundBusyPolicyContract:
             assert cmd.name == name
             assert cmd.busy_policy == "dispatch"
 
-    def test_background_name_is_retired(self):
+    def test_background_name_resolves_to_bg(self):
         from hermes_cli.commands import resolve_command
 
-        assert resolve_command("background") is None
+        assert resolve_command("background") is resolve_command("bg")

@@ -1300,6 +1300,9 @@ class _LoopState:
     system_message: Any
     moa_config: Any
     original_user_message: Any
+    current_user_text: Any
+    reply_to_text: Any
+    internal_context: Any
     conversation_history: Any
     effective_task_id: Any
     turn_id: Any
@@ -1373,6 +1376,7 @@ _CTX_FIELDS = frozenset({
     "user_message", "original_user_message", "conversation_history", "effective_task_id", "turn_id",
     "_should_review_memory", "_plugin_user_context", "_ext_prefetch_cache", "messages",
     "active_system_prompt", "current_turn_user_idx", "_preflight_compression_blocked",
+    "current_user_text", "reply_to_text", "internal_context",
 })
 # Keyword names each phase helper takes (minus ``agent``), cached per function object.
 _PHASE_PARAMS: Dict[Any, tuple] = {}
@@ -1448,6 +1452,10 @@ def _run_conversation_turn(
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    *,
+    current_user_text: Optional[str] = None,
+    reply_to_text: Optional[str] = None,
+    internal_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1478,6 +1486,9 @@ def _run_conversation_turn(
         _ctx = build_turn_context(
             agent, user_message, system_message, conversation_history, task_id,
             stream_callback, persist_user_message, persist_user_timestamp,
+            current_user_text=current_user_text,
+            reply_to_text=reply_to_text,
+            internal_context=internal_context,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             persist_user_platform_id=persist_user_platform_id,
@@ -1605,6 +1616,9 @@ def run_conversation(
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    current_user_text: Optional[str] = None,
+    reply_to_text: Optional[str] = None,
+    internal_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
@@ -1633,6 +1647,9 @@ def run_conversation(
             persist_user_platform_id=persist_user_platform_id,
             moa_config=moa_config,
             turn_author=turn_author,
+            current_user_text=current_user_text,
+            reply_to_text=reply_to_text,
+            internal_context=internal_context,
         )
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)
