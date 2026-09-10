@@ -142,6 +142,18 @@ PRIVACY_PREFIX = (
 # PII the canonical secret redactor deliberately leaves alone; a peer is a third party.
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
+# Preserve the local A2A contract for embedded credential substrings. The native
+# egress scrub intentionally requires token boundaries; neither replaces the other.
+_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "sk-[redacted]"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "sk-ant-[redacted]"),
+    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "ghp_[redacted]"),
+    (re.compile(r"xox[bap]-[A-Za-z0-9\-]{10,}"), "xox-[redacted]"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA[redacted]"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[redacted-jwt]"),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{20,}"), "Bearer [redacted]"),
+)
+
 
 def filter_inbound(text: str) -> str:
     """Defang prompt-injection markers in inbound task text."""
@@ -163,7 +175,14 @@ def redact_outbound(text: str) -> str:
         return text
     from agent.redact import redact_for_egress
 
-    return _EMAIL_RE.sub("[redacted-email]", redact_for_egress(text))
+    # Only native task identifiers are exempt; adjacent arbitrary text must not
+    # weaken credential detection. Captured delimiters preserve the exact span.
+    parts = re.split(r"(?<![A-Za-z0-9_\-])(task-(?:[0-9a-f]{16}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))(?![A-Za-z0-9_\-])", text or "")
+    for index in range(0, len(parts), 2):
+        parts[index] = _EMAIL_RE.sub("[redacted-email]", redact_for_egress(parts[index]))
+        for pat, repl in _REDACTION_PATTERNS:
+            parts[index] = pat.sub(repl, parts[index])
+    return "".join(parts)
 
 
 # Blocked even in localhost-only mode — a remote peer must not make us probe internal services

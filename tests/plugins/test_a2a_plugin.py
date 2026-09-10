@@ -982,6 +982,12 @@ def _send_body(text, ctx="", extra_params=None):
     return {"jsonrpc": "2.0", "id": "1", "method": "message/send", "params": params}
 
 
+@pytest.mark.parametrize("prefix", ["word", "123", "_", "task-", "task-0123456789abcdef-"])
+def test_prefixed_keys_are_still_redacted(prefix):
+    secret = "sk-" + "Z" * 24
+    assert secret not in security.redact_outbound(prefix + secret)
+
+
 class TestIsolatedStructuredFailureHTTP:
     @pytest.mark.parametrize("failed", [False, True])
     def test_http_state_and_readback_follow_runner_result(self, monkeypatch, failed, record_property):
@@ -998,7 +1004,7 @@ class TestIsolatedStructuredFailureHTTP:
                        "failure_retryable": False, "error": "fixture safety refusal"}
                       if failed else {"completed": True})
             event.processing_error = build_error_surface_from_result(result)
-            return f"isolated proof {event.message_id} req-fixture-123"
+            return f"isolated proof {event.message_id} req-fixture-123 wordsk-" + "Z" * 24
 
         async def process(event):
             await adapter._process_message_background(event, "isolated-http-session")
@@ -1015,13 +1021,18 @@ class TestIsolatedStructuredFailureHTTP:
                 expected = protocol.STATE_FAILED if failed else protocol.STATE_COMPLETED
                 assert task["status"]["state"] == expected
                 assert task["id"] == captured["task_id"]
-                assert captured["task_id"] in json.dumps(task)
-                assert "req-fixture-123" in json.dumps(task)
+                assert captured["task_id"] in task["status"]["message"]["parts"][0]["text"]
                 readback = await asyncio.to_thread(_post_json, base + "/", {
                     "jsonrpc": "2.0", "id": "readback", "method": "tasks/get", "params": {"id": task["id"]},
                 }, headers)
                 assert readback["result"]["status"]["state"] == expected
                 assert readback["result"]["id"] == task["id"]
+                for returned in (task, readback["result"]):
+                    text = returned["status"]["message"]["parts"][0]["text"]
+                    assert captured["task_id"] in text
+                    assert "req-fixture-123" in text
+                    assert "sk-" + "Z" * 24 not in text
+                    assert "[redacted]" in text
                 record_property("a2a_http_proof", json.dumps({"response": response, "readback": readback}))
             finally:
                 await adapter.disconnect()
