@@ -4598,6 +4598,7 @@ class BasePlatformAdapter(ABC):
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata["_processing_message_id"] = event.message_id
                 if event.processing_error is not None:
                     _final_thread_metadata["processing_error"] = event.processing_error
                 _tts_paths, _tts_requested_path = [], None

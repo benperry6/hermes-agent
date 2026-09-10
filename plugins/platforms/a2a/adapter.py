@@ -839,7 +839,13 @@ class A2AAdapter(BasePlatformAdapter):
         else:
             state = protocol.STATE_FAILED if (metadata or {}).get("processing_error") is not None else protocol.STATE_COMPLETED
             # The final reply's runner-owned outcome, not error-looking prose, is authoritative.
-            if not self._resolve_oldest_for_context(chat_id, state, content or ""):
+            task_id = (metadata or {}).get("_processing_message_id")
+            if task_id:
+                # A bound late/duplicate reply must never fall through to another task.
+                resolved = self._resolve_task(str(task_id), state, content or "")
+            else:
+                resolved = self._resolve_oldest_for_context(chat_id, state, content or "")
+            if not resolved:
                 logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
