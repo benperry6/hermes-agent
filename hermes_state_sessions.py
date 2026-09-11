@@ -20,6 +20,7 @@ from hermes_state_common import (
     _RECOVERABLE_END_REASONS_SQL, _RESET_CHILD_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _shape_preview,
     _sql_json_extract, _sql_session_last_active, _sql_session_last_active_by_id, escape_like as _escape_like,
     _SQL_IN_CHUNK, _id_chunks, _placeholders as _session_ids_placeholders,
+    _NON_CONTINUATION_CHILD_FILTER_SQL,
 )
 
 # caplog tests pin the "hermes_state" logger name.
@@ -460,7 +461,7 @@ class SessionSessionsMixin:
         f"  AND COALESCE({_sql_json_extract('{alias}model_config', '$._delegate_from')}, '') != ?\n"
         f"  AND COALESCE({_sql_json_extract('{alias}model_config', '$._reset_from')}, '') != ?\n"
         "  AND COALESCE({alias}source, '') != 'tool'\n"
-    )
+    ) + _NON_CONTINUATION_CHILD_FILTER_SQL
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session ended; the first end_reason wins (a compression split must keep

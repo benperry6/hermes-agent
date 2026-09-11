@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_state_common import (
     _BOUNDARY_END_REASONS, _COMPRESSION_LOCK_ROW_SQL as _LOCK_ROW_SQL, _ENDED_ROW_SQL, _ended_by_compression,
-    _RESET_CHILD_SQL, _sql_json_extract, _sql_session_last_active, is_automatic_end_reason)
+    _legacy_reset_child_sql, _RESET_END_REASONS_SQL, _sql_json_extract, _sql_session_last_active,
+    _NON_CONTINUATION_CHILD_FILTER_SQL, is_automatic_end_reason)
 
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
 logger = logging.getLogger("hermes_state")
@@ -32,10 +33,10 @@ _CHAIN_STEP_SQL = f"""
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
                       AND parent.end_reason = 'compression'
-                      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
-                      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
-                      AND NOT ({_RESET_CHILD_SQL.format(a='child')})
-                      AND COALESCE(child.source, '') != 'tool'
+                      {_NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="child.")}
+                      AND COALESCE({_sql_json_extract('child.model_config', '$._reset_from')}, '')
+                          != child.parent_session_id
+                      AND NOT ({_legacy_reset_child_sql("child", _RESET_END_REASONS_SQL)})
                     ORDER BY
                       CASE
                         WHEN child.end_reason = 'compression' THEN 0
@@ -654,7 +655,7 @@ class SessionCompressionMixin:
         a session with ``end_reason='compression'``. The old ``child.started_at >= parent.ended_at`` test
         was too brittle (gateway + compression races insert the real continuation before ``ended_at`` is
         written, while a stale websocket later creates a sibling that passes it). Instead exclude
-        branch/delegate/tool children and prefer children that continue the chain or are still live over
+        branch/delegate/background/reset/tool children and prefer children that continue the chain or are still live over
         stale closed siblings such as ``ws_orphan_reap``."""
         current = session_id
         chain = [current] if current else []

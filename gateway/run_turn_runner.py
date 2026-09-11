@@ -1993,6 +1993,9 @@ class TurnRunner:
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
+            "turn_exit_reason": result.get("turn_exit_reason"),
+            # Explicit non-persistence must survive empty-response recovery too.
+            **({"agent_persisted": result["agent_persisted"]} if "agent_persisted" in result else {}),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],

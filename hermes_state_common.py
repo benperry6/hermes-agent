@@ -6,6 +6,7 @@ import errno
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Any
@@ -146,6 +147,30 @@ _PREVIEW_RAW_SUBQUERY_SQL = (f"COALESCE((SELECT {_PREVIEW_RAW_SELECT} FROM messa
     f" ORDER BY m.timestamp, m.id LIMIT 1), '') AS _preview_raw")
 
 # ── Session lineage predicates ({a} = sessions alias) ───────────────────────
+
+# Independent edges, not inherited session kinds. Compression copies model_config;
+# only a marker naming the immediate parent fences that edge.
+_FORK_EDGE_MARKERS = ("_branched_from", "_delegate_from", "_background_from")
+# Legacy gateway /bg IDs, exactly as minted by datetime + three random bytes.
+# Compression mints YYYYMMDD_HHMMSS_hex6, so only the job's creation edge matches.
+_LEGACY_BACKGROUND_ID_RE = re.compile(r"bg_(?:[01][0-9]|2[0-3])[0-5][0-9][0-5][0-9]_[0-9a-f]{6}")
+_LEGACY_BACKGROUND_CHILD_SQL = (
+    "({alias}parent_session_id IS NOT NULL AND {alias}parent_session_id != ''"
+    " AND {alias}id GLOB 'bg_[0-2][0-9][0-5][0-9][0-5][0-9]_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'"
+    " AND SUBSTR({alias}id, 4, 2) <= '23')"
+)
+# Existing continuation filter, shared by resume, compression and orphan adoption.
+# {alias} is a trusted SQL qualifier, including the trailing dot (or empty).
+_NON_CONTINUATION_CHILD_FILTER_SQL = (
+    "".join(
+        f" AND COALESCE({_sql_json_extract('{alias}model_config', '$.' + marker)}, '')"
+        " != COALESCE({alias}parent_session_id, '')"
+        for marker in _FORK_EDGE_MARKERS
+    )
+    + " AND COALESCE({alias}source, '') != 'tool'"
+    + " AND NOT " + _LEGACY_BACKGROUND_CHILD_SQL
+)
+
 
 # /branch child (kept visible, never cascade-deleted): stable marker OR legacy end_reason heuristic.
 _BRANCH_CHILD_SQL = (f"{_sql_json_extract('{a}.model_config', '$._branched_from')} IS NOT NULL"
