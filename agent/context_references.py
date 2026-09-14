@@ -523,8 +523,15 @@ def _is_binary_file(path: Path) -> bool:
     mime = mimetypes.guess_type(path.name)[0]
     if mime and not mime.startswith("text/") and not path.name.endswith(_TEXT_EXTENSIONS):
         return True
-    with path.open("rb") as fh:  # sniff only; read_bytes() materialized the whole file
-        return b"\x00" in fh.read(4096)
+    from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+    try:
+        # Closing a raw descriptor of a live SQLite file cancels this process's locks.
+        with offline_file_access(path, what="inspect context reference"):
+            with path.open("rb") as fh:
+                return b"\x00" in fh.read(4096)
+    except LiveConnectionError:
+        # Keep the normal binary attachment/metadata path without opening the database.
+        return True
 
 
 def _build_folder_listing(path: Path, cwd: Path, limit: int = 200, display_base: Path | None = None) -> str:
