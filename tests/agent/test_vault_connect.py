@@ -13,6 +13,16 @@ I = 'b' * 26
 SYNTHETIC_VALUE = 'synthetic-only-passphrase'
 
 
+def test_connect_metadata_preserves_native_multi_origin_binding():
+    item = {'id': I, 'vault': {'id': V}, 'title': 'Example', 'urls': [
+        {'href': 'androidapp://example'}, {'href': 'https://example.com/login'},
+        {'href': 'https://accounts.example.com/login'}, {'href': 'https://example.com/other'},
+    ]}
+    meta = OnePasswordLoginBackend._connect_meta(item, V)
+    assert meta.allowed_origins == ('https://example.com', 'https://accounts.example.com')
+    assert 'https://unrelated.example' not in meta.allowed_origins
+
+
 def test_connect_native_metadata_resolution_and_fail_closed(monkeypatch):
     requests = []
     state = {'status': 200}
@@ -156,6 +166,34 @@ def test_connect_without_usable_seed_stays_single_factor(monkeypatch):
             handle = backend.list_items()[0].id
             assert backend.get_meta(handle).has_otp is False
             assert backend.resolve_otp(handle) is None
+        finally:
+            reset_secret_scope(scope); set_multiplex_active(False)
+            server.shutdown(); server.server_close(); thread.join()
+
+
+def test_connect_unusable_first_otp_field_does_not_hide_a_usable_one(monkeypatch):
+    """An unusable OTP candidate must not mask a later usable seed on the same item.
+
+    Regression: the helper used to take the FIRST eligible OTP field and give up when it was
+    blank or could not mint, so a valid second seed was reported as "no second factor" and the
+    automatic login path silently fell back to asking the user.
+    """
+    from agent.vault_store import normalize_otp_secret, totp_now
+    for first in ('', 'A'):
+        fields = [{'purpose': 'PASSWORD', 'value': SYNTHETIC_VALUE},
+                  {'type': 'OTP', 'value': first},
+                  {'type': 'OTP', 'value': OTP_URI}]
+        server, thread = _connect_server(fields)
+        monkeypatch.delenv('OP_SERVICE_ACCOUNT_TOKEN', raising=False)
+        set_multiplex_active(True)
+        backend, scope = _scoped_backend(server)
+        try:
+            handle = backend.list_items()[0].id
+            assert backend.get_meta(handle).has_otp is True, 'the usable second seed must be found'
+            seed = normalize_otp_secret(OTP_URI)
+            before = totp_now(seed)
+            code = backend.resolve_otp(handle)
+            assert code in {before, totp_now(seed)}
         finally:
             reset_secret_scope(scope); set_multiplex_active(False)
             server.shutdown(); server.server_close(); thread.join()
