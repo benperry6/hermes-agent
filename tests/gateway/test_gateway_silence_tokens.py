@@ -14,6 +14,8 @@ from gateway.response_filters import (
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
 )
+from gateway.run_turn_runner import TurnRunner
+from gateway.turn_context import TurnContext
 
 
 def _source():
@@ -186,6 +188,125 @@ async def test_queued_human_turn_also_gets_the_visible_fallback():
     )
 
     assert "silence marker" in runner._deliver_queued_first_response.await_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes, expected_silence", [
+    ({}, True),
+    ({"completed": False}, False),
+    ({"external_deliveries": []}, False),
+    ({"turn_exit_reason": "text_response"}, False),
+])
+async def test_external_delivery_complete_does_not_warn_or_send_again(
+    monkeypatch, tmp_path, changes, expected_silence,
+):
+    """A verified terminal receipt completes a human turn, unlike a model's NO_REPLY."""
+    runner = _runner(monkeypatch, tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(), _streaming_tts_turn_completed=lambda *_a: False)
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._hmwa_first_contact_notes = AsyncMock()
+    result = {
+        "final_response": "NO_REPLY", "messages": [], "tools": [],
+        "history_offset": 0, "last_prompt_tokens": 0, "api_calls": 1,
+        "failed": False, "completed": True,
+        "turn_exit_reason": "external_delivery_complete", "delivery_already_sent": True,
+        "external_deliveries": [{
+            "protocol": "hermes.external_delivery", "version": 1, "status": "complete",
+            "target": "telegram:group:-1001", "message_ids": ["delivered"],
+            "content_sha256": "a" * 64, "tool_call_id": "tool-1",
+        }],
+    }
+    result.update(changes)
+    runner._run_agent = AsyncMock(return_value=result)
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1,
+    )
+
+    if expected_silence:
+        assert response == ""
+    else:
+        assert "silence marker" in response
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_external_delivery_survives_agent_to_gateway_projection(monkeypatch, tmp_path):
+    """The real turn projection must not lose the receipt before the human guard sees it."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner._provider_routing = {}
+    runner._resolve_session_agent_runtime = MagicMock(return_value=("offline", {}))
+    runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+    runner._resolve_session_service_tier = MagicMock(return_value=None)
+    runner._resolve_turn_agent_config = MagicMock(return_value={})
+    agent = SimpleNamespace(model="offline", context_compressor=SimpleNamespace(
+        last_prompt_tokens=0, context_length=100_000,
+    ))
+    ctx = TurnContext(
+        source=_source(), session_id="sess-silent",
+        session_key="agent:main:telegram:group:-1001:12345",
+        message="side chatter", history=[], user_config={},
+    )
+    ctx.agent_holder[0] = agent
+    turn = TurnRunner(runner, ctx)
+    for name, value in {
+        "_combined_ephemeral_prompt": None,
+        "_setup_stream_consumer": (None, None, None, False),
+        "_resolve_turn_agent": (agent, False),
+        "_wire_turn_agent_callbacks": None,
+        "_load_turn_history": ([], None, []),
+        "_prepare_turn_message": (None, None),
+        "_finish_stream_consumer": None,
+        "_sync_session_after_run": (False, "sess-silent", 0),
+    }.items():
+        monkeypatch.setattr(turn, name, MagicMock(return_value=value))
+    turn._run_conversation_with_approval = MagicMock(return_value={
+        "final_response": "NO_REPLY", "messages": [], "api_calls": 1,
+        "failed": False, "completed": True,
+        "turn_exit_reason": "external_delivery_complete", "delivery_already_sent": True,
+        "external_deliveries": [{
+            "protocol": "hermes.external_delivery", "version": 1, "status": "complete",
+            "target": "telegram:group:-1001", "message_ids": ["delivered"],
+            "content_sha256": "a" * 64, "tool_call_id": "tool-1",
+        }],
+    })
+    projected = turn.run_sync()
+    runner._run_agent = AsyncMock(return_value=projected)
+    runner._hmwa_first_contact_notes = AsyncMock()
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), ctx.session_key, 1,
+    )
+
+    assert response == ""
+    assert projected["delivery_already_sent"] is True
+    assert projected["external_deliveries"]
+
+
+@pytest.mark.asyncio
+async def test_queued_external_delivery_does_not_warn_or_send_again():
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner._deliver_queued_first_response = AsyncMock()
+    turn_ctx = SimpleNamespace(
+        session_key="agent:main:telegram:group:-1001:12345",
+        stream_consumer_holder=[None], mute_notification_reply=False,
+        persist_user_display_kind=None, source=_source(),
+        _status_thread_metadata=None, event_message_id=None,
+        inbound_message_id="msg-42", run_generation=1,
+    )
+    result = {
+        "final_response": "NO_REPLY", "failed": False, "completed": True,
+        "turn_exit_reason": "external_delivery_complete", "delivery_already_sent": True,
+        "external_deliveries": [{
+            "protocol": "hermes.external_delivery", "version": 1, "status": "complete",
+            "target": "telegram:group:-1001", "message_ids": ["delivered"],
+            "content_sha256": "a" * 64, "tool_call_id": "tool-1",
+        }],
+    }
+
+    await runner._run_agent_deliver_first_response(turn_ctx, None, result, result, None)
+
+    runner._deliver_queued_first_response.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -1503,7 +1503,11 @@ class GatewayTurnMixin:
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up may go silent, a human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
-        if _intentional_silence and not is_machinery_display_kind(_silence_kind):
+        # A terminal receipt is a completed delivery, not a model asking to disappear.
+        # Human turns still reject bare NO_REPLY when there was no proven delivery.
+        from gateway.response_filters import is_completed_external_delivery_result
+        if (_intentional_silence and not is_machinery_display_kind(_silence_kind)
+                and not is_completed_external_delivery_result(agent_result)):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -3870,7 +3874,9 @@ class GatewayTurnMixin:
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
-            if is_machinery_display_kind(turn_ctx.persist_user_display_kind):
+            from gateway.response_filters import is_completed_external_delivery_result
+            if (is_completed_external_delivery_result(_delivery_result)
+                    or is_machinery_display_kind(turn_ctx.persist_user_display_kind)):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
