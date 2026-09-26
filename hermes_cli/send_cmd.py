@@ -118,13 +118,23 @@ def _write_telegram_turn_receipt(result_json: str, *, target: str, message: str)
     })
     if receipt is None:
         return False
+    receipt_path = None
+    created = False
     try:
         receipt_path = Path(os.environ[EXTERNAL_DELIVERY_ENV])
         fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
         with os.fdopen(fd, "w", encoding="utf-8") as out:
             json.dump(receipt, out)
         return True
     except (OSError, KeyError):
+        # The gateway rejects malformed JSON and unsuccessful terminal calls;
+        # also remove the partial file rather than leaving a stale artifact.
+        if created and receipt_path is not None:
+            try:
+                receipt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return False
 
 
