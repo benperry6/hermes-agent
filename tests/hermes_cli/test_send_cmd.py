@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import hashlib
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -75,6 +76,7 @@ def test_telegram_final_response_receipt_completes_human_turn(fake_tool, monkeyp
     with pytest.raises(SystemExit) as exc:
         send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "--json", "test reply"]))
     assert exc.value.code == 0
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert json.loads(path.read_text()) == {
         "protocol": "hermes.external_delivery", "version": 1, "status": "complete",
         "target": "telegram:-1001:8372", "message_ids": ["m123"],
@@ -133,6 +135,56 @@ def test_final_response_requires_a_turn_and_an_explicit_topic_before_sending(
         with pytest.raises(SystemExit) as exc:
             send_cmd.cmd_send(_parse(["--to", target, "--final-response", text]))
         assert exc.value.code == 2 and not fake_tool.calls
+
+
+def test_final_response_existing_receipt_refuses_before_send(fake_tool, monkeypatch, tmp_path):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    path = tmp_path / "receipt.json"
+    path.write_text("already delivered")
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "reply"]))
+    assert exc.value.code == 2
+    assert not fake_tool.calls
+    assert path.read_text() == "already delivered"
+
+
+@pytest.mark.parametrize("text", ["", "   ", "a" * 4097, "_" * 3000])
+def test_final_response_rejects_empty_or_split_text_before_send(
+    fake_tool, monkeypatch, tmp_path, text,
+):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr(send_cmd, "_read_message_body", lambda *_args: text)
+    path = tmp_path / "receipt.json"
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", text]))
+    assert exc.value.code == 2
+    assert not fake_tool.calls and not path.exists()
+
+
+def test_final_response_missing_receipt_directory_refuses_before_send(fake_tool, monkeypatch, tmp_path):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(tmp_path / "missing" / "receipt.json"))
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "reply"]))
+    assert exc.value.code == 2 and not fake_tool.calls
+
+
+def test_final_response_ambiguous_identifier_never_silences_gateway(fake_tool, monkeypatch, tmp_path):
+    from gateway.response_filters import is_completed_external_delivery_result
+
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    path = tmp_path / "receipt.json"
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
+    fake_tool.payload = {"success": True, "platform": "telegram", "chat_id": "-1001", "message_id": True}
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "reply"]))
+    assert exc.value.code == 1 and len(fake_tool.calls) == 1 and not path.exists()
+    assert not is_completed_external_delivery_result({
+        "final_response": "NO_REPLY", "failed": False, "completed": True,
+        "external_deliveries": [],
+    })
 
 
 # ---------------------------------------------------------------------------
