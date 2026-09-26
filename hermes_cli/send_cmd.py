@@ -341,8 +341,10 @@ def cmd_send(args: argparse.Namespace) -> None:
         tool_args["mentions"] = mentions
     result = send_message_tool(tool_args)
     if final_response and not _write_telegram_turn_receipt(result, target=target, message=message or ""):
-        _emit_result(result, json_mode=getattr(args, "json", False), quiet=False)
-        _fail("hermes send: delivery is not a verified final response; no turn receipt written.", _FAILURE_EXIT)
+        # A transport success followed by receipt failure is NOT permission to
+        # retry: preserve its exact ID even when --json was not requested.
+        _emit_result(result, json_mode=True, quiet=False)
+        _fail("hermes send: final-response receipt not confirmed; delivery may have succeeded — verify the destination before retrying.", _FAILURE_EXIT)
     sys.exit(_emit_result(result, json_mode=getattr(args, "json", False), quiet=getattr(args, "quiet", False)))
 
 
