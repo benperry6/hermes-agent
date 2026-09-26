@@ -178,6 +178,7 @@ def test_final_response_ambiguous_identifier_never_silences_gateway(fake_tool, m
     monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     path = external_delivery_receipt_path("session", "turn", "call-ambiguous")
+    assert path.is_relative_to(tmp_path)
     path.parent.mkdir(parents=True)
     monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
     fake_tool.payload = {"success": True, "platform": "telegram", "chat_id": "-1001", "message_id": True}
@@ -222,7 +223,7 @@ def test_final_response_uses_sender_formatted_utf16_one_bubble_bound(
     assert path.exists() == allowed
 
 
-def test_final_response_write_error_removes_partial_receipt(fake_tool, monkeypatch, tmp_path):
+def test_final_response_write_error_removes_partial_receipt(fake_tool, monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
     path = tmp_path / "receipt.json"
     monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
@@ -236,6 +237,9 @@ def test_final_response_write_error_removes_partial_receipt(fake_tool, monkeypat
     with pytest.raises(SystemExit) as exc:
         send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "reply"]))
     assert exc.value.code == 1 and len(fake_tool.calls) == 1 and not path.exists()
+    output = capsys.readouterr()
+    assert json.loads(output.out)["message_id"] == "m123"
+    assert "verify the destination before retrying" in output.err
 
 
 @pytest.mark.parametrize("kind", ["relative", "wrong_suffix", "dangling_symlink"])
