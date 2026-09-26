@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -79,6 +81,47 @@ def _emit_result(result_json: str, *, json_mode: bool, quiet: bool) -> int:
     if not payload.get("error") and (payload.get("skipped") or payload.get("success")):
         return _SUCCESS_EXIT
     return _FAILURE_EXIT
+
+
+def _write_telegram_turn_receipt(result_json: str, *, target: str, message: str) -> bool:
+    """Complete an opted-in terminal turn only with an identified Telegram send.
+
+    An ordinary ``hermes send`` can be a side effect followed by a useful answer;
+    it must not silence that answer just because a message went out.
+    """
+    from agent.external_delivery import (
+        EXTERNAL_DELIVERY_ENV, EXTERNAL_DELIVERY_PROTOCOL,
+        EXTERNAL_DELIVERY_VERSION, validate_external_delivery_receipt,
+    )
+
+    try:
+        payload = json.loads(result_json)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    parts = target.split(":")
+    if (len(parts) != 3 or parts[0] != "telegram"
+            or not parts[1].lstrip("-").isdigit() or not parts[2].isdigit()
+            or not isinstance(payload, dict) or payload.get("success") is not True
+            or payload.get("skipped") or payload.get("error")
+            or payload.get("platform") != "telegram"
+            or str(payload.get("chat_id")) != parts[1]):
+        return False
+    message_id = payload.get("message_id")
+    if not isinstance(message_id, (str, int)) or not str(message_id).strip():
+        return False
+    receipt = validate_external_delivery_receipt({
+        "protocol": EXTERNAL_DELIVERY_PROTOCOL, "version": EXTERNAL_DELIVERY_VERSION,
+        "status": "complete", "target": target, "message_ids": [str(message_id)],
+        "content_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+    })
+    if receipt is None:
+        return False
+    try:
+        with Path(os.environ[EXTERNAL_DELIVERY_ENV]).open("x", encoding="utf-8") as out:
+            json.dump(receipt, out)
+        return True
+    except (OSError, KeyError):
+        return False
 
 
 def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
@@ -228,6 +271,21 @@ def cmd_send(args: argparse.Namespace) -> None:
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
 
+    final_response = getattr(args, "final_response", False)
+    if final_response:
+        message = message or ""
+        from agent.external_delivery import EXTERNAL_DELIVERY_ENV
+        parts = target.split(":")
+        if (not os.environ.get(EXTERNAL_DELIVERY_ENV)
+                or len(parts) != 3 or parts[0] != "telegram"
+                or not parts[1].lstrip("-").isdigit() or not parts[2].isdigit()
+                or "MEDIA:" in message or "[[as_document]]" in message):
+            _fail("hermes send: --final-response requires a terminal turn receipt, plain text, and an explicit Telegram topic target.", _USAGE_EXIT)
+        try:
+            message.encode("utf-8")
+        except UnicodeEncodeError:
+            _fail("hermes send: --final-response requires valid UTF-8 text.", _USAGE_EXIT)
+
     # Lazy import keeps `hermes send --help` fast (no tool registry / gateway config stack).
     from tools.send_message_tool import send_message_tool
 
@@ -237,6 +295,9 @@ def cmd_send(args: argparse.Namespace) -> None:
     if mentions:
         tool_args["mentions"] = mentions
     result = send_message_tool(tool_args)
+    if final_response and not _write_telegram_turn_receipt(result, target=target, message=message or ""):
+        _emit_result(result, json_mode=getattr(args, "json", False), quiet=False)
+        _fail("hermes send: delivery is not a verified final response; no turn receipt written.", _FAILURE_EXIT)
     sys.exit(_emit_result(result, json_mode=getattr(args, "json", False), quiet=getattr(args, "quiet", False)))
 
 
@@ -259,6 +320,9 @@ _SEND_ARGUMENTS = (
                             help="List available targets. Optional positional filter: `hermes send --list telegram`.")),
     (("-q", "--quiet"), dict(action="store_true", default=False, help="Suppress stdout on success (exit code only).")),
     (("--json",), dict(action="store_true", default=False, help="Emit raw JSON result instead of human-readable output.")),
+    (("--final-response",), dict(action="store_true", default=False, help=(
+        "For an agent terminal turn only: after a verified send to an explicit Telegram topic, "
+        "write its external-delivery receipt so the gateway does not send a second response."))),
 )
 
 

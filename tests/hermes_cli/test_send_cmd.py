@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import io
 import json
+import hashlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,6 +59,80 @@ def fake_tool(monkeypatch):
     # entry so attribute lookup works.
     monkeypatch.setitem(sys.modules, "tools.send_message_tool", mod)
     return fake
+
+
+def test_telegram_final_response_receipt_completes_human_turn(fake_tool, monkeypatch, tmp_path):
+    """A deliberately terminal CLI send must meet the existing turn receipt contract."""
+    from agent.external_delivery import consume_external_delivery_receipts, external_delivery_receipt_path
+    from gateway.response_filters import is_completed_external_delivery_result
+
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = external_delivery_receipt_path("session", "turn", "call-1")
+    path.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
+    fake_tool.payload = {"success": True, "platform": "telegram", "chat_id": "-1001", "message_id": "m123"}
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "--json", "test reply"]))
+    assert exc.value.code == 0
+    assert json.loads(path.read_text()) == {
+        "protocol": "hermes.external_delivery", "version": 1, "status": "complete",
+        "target": "telegram:-1001:8372", "message_ids": ["m123"],
+        "content_sha256": hashlib.sha256(b"test reply").hexdigest(),
+    }
+    call = SimpleNamespace(id="call-1", function=SimpleNamespace(name="terminal"))
+    receipts = consume_external_delivery_receipts(
+        session_id="session", turn_id="turn", tool_calls=[call],
+        messages=[{"role": "tool", "tool_call_id": "call-1",
+                   "content": json.dumps({"exit_code": 0, "error": None})}],
+    )
+    assert receipts and not path.exists()
+    assert is_completed_external_delivery_result({
+        "failed": False, "completed": True, "delivery_already_sent": True,
+        "turn_exit_reason": "external_delivery_complete", "external_deliveries": receipts,
+    })
+
+
+@pytest.mark.parametrize("flag,payload", [
+    (False, {"success": True, "platform": "telegram", "chat_id": "-1001", "message_id": "m123"}),
+    (True, {"success": False, "platform": "telegram", "chat_id": "-1001", "message_id": "m123"}),
+    (True, {"skipped": True, "platform": "telegram", "chat_id": "-1001", "message_id": "m123"}),
+    (True, {"success": True, "platform": "telegram", "chat_id": "-1001"}),
+    (True, {"success": True, "platform": "telegram", "chat_id": "-1002", "message_id": "m123"}),
+])
+def test_telegram_send_never_receipts_non_terminal_or_unproven_delivery(
+    fake_tool, monkeypatch, tmp_path, flag, payload,
+):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    path = tmp_path / "receipt.json"
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
+    fake_tool.payload = payload
+    args = ["--to", "telegram:-1001:8372", "--json", "test reply"]
+    if flag:
+        args.append("--final-response")
+    with pytest.raises(SystemExit):
+        send_cmd.cmd_send(_parse(args))
+    assert not path.exists()
+
+
+def test_final_response_requires_a_turn_and_an_explicit_topic_before_sending(
+    fake_tool, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.delenv("HERMES_TURN_RECEIPT_FILE", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "reply"]))
+    assert exc.value.code == 2 and not fake_tool.calls
+
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(tmp_path / "receipt.json"))
+    for target, text in [
+        ("telegram:-1001", "reply"),
+        ("telegram:unverified:8372", "reply"),
+        ("telegram:-1001:8372", "MEDIA:unverified.png"),
+    ]:
+        with pytest.raises(SystemExit) as exc:
+            send_cmd.cmd_send(_parse(["--to", target, "--final-response", text]))
+        assert exc.value.code == 2 and not fake_tool.calls
 
 
 # ---------------------------------------------------------------------------
