@@ -157,6 +157,19 @@ def _compose_gateway_ephemeral_prompt(
     return "\n\n".join(part for part in parts if part)
 
 
+def _supported_optional_kwargs(callback: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep optional call extensions compatible with narrower callables."""
+    import inspect
+
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in parameters}
+
+
 def _gateway_session_db_inner(gateway):
     """The raw SessionDB behind ``gateway._session_db`` (unwrapping the async facade), or None."""
     session_db = getattr(gateway, "_session_db", None)

@@ -47,6 +47,10 @@ def _make_runner():
     # and make the session-scoped reasoning resolver receive a MagicMock.
     mock_store.get_model_override.return_value = None
     runner.session_store = mock_store
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.get_or_create_session = AsyncMock(
+        side_effect=lambda source: runner.session_store.get_or_create_session(source)
+    )
 
     from gateway.hooks import HookRegistry
     runner.hooks = HookRegistry()
@@ -624,3 +628,26 @@ class TestHandleBtwCommand:
         mock_adapter.send.assert_called_once()
         sent_text = mock_adapter.send.call_args[0][1]
         assert "it was foo.py" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_background_preserves_delivery_for_narrow_agent_signature():
+    runner = _make_runner()
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    adapter.extract_media.return_value = ([], "narrow callable complete")
+    adapter.extract_images.return_value = ([], "narrow callable complete")
+    adapter.emit_warning = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    source = _make_event().source
+    calls = []
+    def narrow_run(user_message, task_id):
+        calls.append((user_message,task_id))
+        return {"final_response":"narrow callable complete","messages":[]}
+    with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key":"test-key"}), patch("gateway.run._load_gateway_config",return_value={}), patch("run_agent.AIAgent") as Factory:
+        Factory.return_value.run_conversation = narrow_run
+        await runner._run_background_task("narrow payload",source,"bg_narrow")
+    assert calls == [("narrow payload","bg_narrow")]
+    adapter.send.assert_awaited_once()
+    assert "narrow callable complete" in adapter.send.await_args.kwargs["content"]
+    adapter.emit_warning.assert_not_called()

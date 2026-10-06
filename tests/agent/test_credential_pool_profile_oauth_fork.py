@@ -352,6 +352,39 @@ def test_borrower_prune_never_deletes_root_singleton_grant(fleet, tmp_path):
     assert fleet["rows"](root)[0]["refresh_token"] == "sk-ant-ort-RT1"
 
 
+def test_root_declared_status_clear_preserves_unmentioned_sibling(fleet):
+    from datetime import datetime, timezone
+    from agent.credential_pool import load_pool
+
+    root = fleet["root"]
+    store = json.loads((root / "auth.json").read_text())
+    row = store["credential_pool"]["anthropic"][0]
+    row.update({
+        "last_status": "dead",
+        "last_status_at": "2099-01-01T00:00:00+00:00",
+        "last_error_code": 401,
+        "last_error_reason": "invalid_grant",
+    })
+    sibling = dict(row)
+    sibling.update({"id": "def456", "label": "sibling-grant"})
+    store["credential_pool"]["anthropic"].append(sibling)
+    (root / "auth.json").write_text(json.dumps(store))
+
+    fleet["use"](root)
+    cleared = load_pool("anthropic").reset_status("abc123")
+    assert cleared is not None
+
+    persisted = {entry["id"]: entry for entry in fleet["rows"](root)}
+    assert persisted["abc123"]["last_status"] is None
+    assert persisted["abc123"]["last_status_at"] is None
+    assert persisted["abc123"]["last_error_code"] is None
+    assert persisted["abc123"]["last_error_reason"] is None
+    assert persisted["def456"]["last_status"] == "dead"
+    assert persisted["def456"]["last_status_at"] == datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp()
+    assert persisted["def456"]["last_error_code"] == 401
+    assert persisted["def456"]["last_error_reason"] == "invalid_grant"
+
+
 def test_profile_auth_add_owns_only_its_own_rows(fleet):
     from agent.credential_pool import AUTH_TYPE_OAUTH, PooledCredential, load_pool
 

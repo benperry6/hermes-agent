@@ -1695,18 +1695,20 @@ class TurnRunner:
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
-            kwargs = {
-                "conversation_history": agent_history, "task_id": ctx.session_id,
+            from gateway.run import _supported_optional_kwargs
+            kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
+            kwargs.update(_supported_optional_kwargs(agent.run_conversation, {
                 "current_user_text": ctx.current_user_text,
                 "reply_to_text": ctx.reply_to_text,
                 "internal_context": ctx.internal_context,
-            }
+            }))
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
                 kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
                                          "is_bot": bool(getattr(ctx.source, "is_bot", False))}
             if ctx.title_user_message is not None:
                 kwargs["title_user_message"] = ctx.title_user_message
+
 
 
             if persist_user_message_override is not None:
