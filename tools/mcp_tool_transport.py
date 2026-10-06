@@ -154,7 +154,7 @@ class MCPServerTransportMixin:
 
     __slots__ = ()
 
-    def _advertises_tools(self) -> bool:
+    def _advertises_tools(self, initialize_result=None) -> bool:
         """False only when captured capabilities omit ``tools`` (prompt-/resource-only servers,
         where ``tools/list`` raises -32601); True without capability info (legacy fallback).
 
@@ -163,7 +163,9 @@ class MCPServerTransportMixin:
         against them raises ``MCPError(-32601 Method not found)`` — which previously killed the connection
         during discovery and made every keepalive fail. (Ported from anomalyco/opencode#31271.)
         """
-        caps = getattr(self.initialize_result, "capabilities", None)
+        if initialize_result is None:
+            initialize_result = self.initialize_result
+        caps = getattr(initialize_result, "capabilities", None)
         return caps is None or getattr(caps, "tools", None) is not None
 
     def _session_kwargs(self) -> dict:
@@ -251,7 +253,7 @@ class MCPServerTransportMixin:
         breaker state but leaves the session UNPROVEN: flapping transports handshake fine and drop
         moments later, so only keepalive/tool-call success clears the reconnect budget."""
         self.initialize_result = await self._negotiate_session(session, connect_timeout)
-        self.session = session
+        self._adopt_session(session)
         if mark_lifecycle:
             self._mark_lifecycle_started()
         await self._discover_tools()
