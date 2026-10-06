@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -107,7 +108,8 @@ def _write_telegram_turn_receipt(result_json: str, *, target: str, message: str)
             or str(payload.get("chat_id")) != parts[1]):
         return False
     message_id = payload.get("message_id")
-    if not isinstance(message_id, (str, int)) or not str(message_id).strip():
+    if (isinstance(message_id, bool) or not isinstance(message_id, (str, int))
+            or not str(message_id).strip()):
         return False
     receipt = validate_external_delivery_receipt({
         "protocol": EXTERNAL_DELIVERY_PROTOCOL, "version": EXTERNAL_DELIVERY_VERSION,
@@ -117,11 +119,42 @@ def _write_telegram_turn_receipt(result_json: str, *, target: str, message: str)
     if receipt is None:
         return False
     try:
-        with Path(os.environ[EXTERNAL_DELIVERY_ENV]).open("x", encoding="utf-8") as out:
+        receipt_path = Path(os.environ[EXTERNAL_DELIVERY_ENV])
+        fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
             json.dump(receipt, out)
         return True
     except (OSError, KeyError):
         return False
+
+
+def _preflight_final_response_receipt(message: str) -> bool:
+    """Refuse predictable receipt/splitting failures before the external send.
+
+    The standalone Telegram sender returns only the *last* chunk's ID. A final
+    response must therefore fit in one formatted Telegram bubble, not merely
+    in one raw-text chunk; normal multi-block reports have their own finalizer.
+    """
+    from agent.external_delivery import EXTERNAL_DELIVERY_ENV
+    from gateway.platforms.base import utf16_len
+    from tools.send_message_senders import _telegram_format
+
+    raw = os.environ.get(EXTERNAL_DELIVERY_ENV, "")
+    path = Path(raw) if raw else None
+    if (path is None or not path.is_absolute() or path.suffix != ".json"
+            or not path.parent.is_dir() or path.exists() or path.is_symlink()
+            or not message.strip()):
+        return False
+    try:
+        if utf16_len(_telegram_format(message)[0]) > 4096:
+            return False
+        # A successful send followed by a predictable unwritable receipt would
+        # invite an unsafe retry. Probe the directory without touching the turn path.
+        with tempfile.TemporaryFile(dir=path.parent):
+            pass
+    except (OSError, UnicodeError):
+        return False
+    return True
 
 
 def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
@@ -285,6 +318,8 @@ def cmd_send(args: argparse.Namespace) -> None:
             message.encode("utf-8")
         except UnicodeEncodeError:
             _fail("hermes send: --final-response requires valid UTF-8 text.", _USAGE_EXIT)
+        if not _preflight_final_response_receipt(message):
+            _fail("hermes send: --final-response requires one nonempty Telegram text bubble and a free, writable turn receipt path; no message sent.", _USAGE_EXIT)
 
     # Lazy import keeps `hermes send --help` fast (no tool registry / gateway config stack).
     from tools.send_message_tool import send_message_tool
@@ -321,8 +356,10 @@ _SEND_ARGUMENTS = (
     (("-q", "--quiet"), dict(action="store_true", default=False, help="Suppress stdout on success (exit code only).")),
     (("--json",), dict(action="store_true", default=False, help="Emit raw JSON result instead of human-readable output.")),
     (("--final-response",), dict(action="store_true", default=False, help=(
-        "For an agent terminal turn only: after a verified send to an explicit Telegram topic, "
-        "write its external-delivery receipt so the gateway does not send a second response."))),
+        "Use only for a direct, terminal Telegram text send followed by NO_REPLY: "
+        "prove one message ID and write the per-turn receipt so the gateway does not reply twice. "
+        "Refuses text that Telegram would split; use the aggregate finalizer for multi-block reports. "
+        "Ordinary sends that precede a useful answer must not use this flag."))),
 )
 
 
