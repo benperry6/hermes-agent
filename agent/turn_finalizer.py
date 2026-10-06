@@ -529,7 +529,13 @@ def finalize_turn(
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
 
+    external_delivery_receipts = list(getattr(agent, "_turn_external_delivery_receipts", None) or [])
+    external_delivery_complete = (
+        str(_turn_exit_reason) == "external_delivery_complete" and bool(external_delivery_receipts)
+    )
+
     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
+
         agent, final_response=final_response, api_call_count=api_call_count,
         interrupted=interrupted, failed=failed, messages=messages,
         _turn_exit_reason=_turn_exit_reason,
@@ -587,7 +593,8 @@ def finalize_turn(
         final_response is not None
         and not failed
         and not interrupted
-        and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))
+        and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response(")
+             or external_delivery_complete)
     )
 
     _rollback_interrupted_preflight_display(agent, interrupted)
@@ -642,9 +649,9 @@ def finalize_turn(
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
     # Response transforms apply only to real, uninterrupted responses.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not external_delivery_complete:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not interrupted:
+    if not interrupted and not external_delivery_complete:
         final_response = _explain_abnormal_exit(
             agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )
@@ -652,7 +659,7 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
-    if final_response and not interrupted:
+    if final_response and not interrupted and not external_delivery_complete:
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
@@ -717,6 +724,9 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if external_delivery_complete:
+        result["delivery_already_sent"] = True
+        result["external_deliveries"] = external_delivery_receipts
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True; also stamp `error` so the gateway
@@ -762,10 +772,11 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message, final_response=final_response,
-        interrupted=interrupted, messages=messages,
-    )
+    if not external_delivery_complete:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message, final_response=final_response,
+            interrupted=interrupted, messages=messages,
+        )
 
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
@@ -774,6 +785,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and not external_delivery_complete
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):

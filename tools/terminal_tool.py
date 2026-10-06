@@ -1239,7 +1239,8 @@ def _yield_kwargs(command: str, **ctx) -> dict:
 
 def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
-    task_id: Optional[str], session_id: Optional[str], session_key: str,
+    task_id: Optional[str], session_id: Optional[str], turn_id: Optional[str],
+    tool_call_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
     metered: bool = True,
 ) -> str:
@@ -1268,8 +1269,15 @@ def _run_foreground(
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
+            execution_command = command
+            if env_type == "local" and session_id and turn_id and tool_call_id:
+                from agent.external_delivery import (
+                    inject_external_delivery_receipt_env, prepare_external_delivery_receipt_path,
+                )
+                receipt_path = prepare_external_delivery_receipt_path(session_id, turn_id, tool_call_id)
+                execution_command = inject_external_delivery_receipt_env(command, receipt_path)
             result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                execution_command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
             )
@@ -1372,6 +1380,8 @@ def terminal_tool(
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
@@ -1476,7 +1486,8 @@ def terminal_tool(
             return _metered(None if _host_local else plan, result)
         return _metered(None if _host_local else plan, _run_foreground(
             command, env, plan,
-            task_id=task_id, session_id=session_id, session_key=session_key,
+            task_id=task_id, session_id=session_id, turn_id=turn_id,
+            tool_call_id=tool_call_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
             metered=not _host_local,
         ))
@@ -1621,6 +1632,8 @@ def _handle_terminal(args, **kw):
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
+        turn_id=kw.get("turn_id"),
+        tool_call_id=kw.get("tool_call_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,

@@ -31,6 +31,8 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
+from agent.external_delivery import TERMINAL_RESULT_METADATA_KEY, capture_terminal_result_metadata
+
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
@@ -1104,6 +1106,7 @@ def _commit_tool_result(
     _status_suffix = " (error)" if is_error else ""
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
+    terminal_result_metadata = capture_terminal_result_metadata(function_name, function_result)
     persisted_result = function_result
     if _is_multimodal_tool_result(persisted_result):
         persisted_result = _persist_multimodal_text_parts(
@@ -1143,6 +1146,9 @@ def _commit_tool_result(
                 tool_message["display_metadata"] = metadata
         except Exception as callback_error:
             logging.debug("Tool result metadata callback error: %s", callback_error)
+    if terminal_result_metadata is not None:
+        tool_message[TERMINAL_RESULT_METADATA_KEY] = terminal_result_metadata
+
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
