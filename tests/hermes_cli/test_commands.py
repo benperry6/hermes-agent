@@ -138,6 +138,16 @@ class TestGatewayHelpLines:
                     f"cli_only command /{cmd.name} should not be in gateway help"
 
 
+    def test_bg_and_btw_are_separate_commands(self):
+        lines = gateway_help_lines()
+        joined = "\n".join(lines)
+        assert "`/bg" in joined
+        assert "`/btw" in joined
+        background_alias_lines = [line for line in lines if "/background" in line]
+        assert len(background_alias_lines) == 1
+        assert background_alias_lines[0].startswith("`/bg <prompt>`")
+
+
 
 class TestTelegramBotCommands:
 

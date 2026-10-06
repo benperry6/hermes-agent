@@ -24,14 +24,15 @@ from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
 )
+
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
-    build_session_context,
+    build_session_context, build_session_context_prompt,
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
@@ -578,26 +579,12 @@ class GatewayTurnMixin:
         """Prepend topic/channel-bound skill payload(s) to ``event.text`` on a new session."""
         _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
         try:
-            from agent.skill_commands import _load_skill_payload, _build_skill_message
-            _combined_parts: list[str] = []
-            _loaded_names: list[str] = []
-            for _sname in _skill_names:
-                _loaded = _load_skill_payload(_sname, task_id=_quick_key)
-                if not _loaded:
-                    logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
-                    continue
-                _loaded_skill, _skill_dir, _display_name = _loaded
-                _part = _build_skill_message(
-                    _loaded_skill, _skill_dir,
-                    f'[IMPORTANT: The "{_display_name}" skill is auto-loaded. '
-                    f"Follow its instructions for this session.]",
-                )
-                if _part:
-                    _combined_parts.append(_part)
-                    _loaded_names.append(_sname)
-            if _combined_parts:
-                _combined_parts.append(event.text)  # user's original text after the payloads
-                event.text = "\n\n".join(_combined_parts)
+            from gateway.run import _build_auto_skill_context
+            context, _loaded_names = _build_auto_skill_context(
+                _skill_names, task_id=_quick_key,
+            )
+            if context:
+                event.text = f"{context}\n\n{event.text}"
                 logger.info("[Gateway] Auto-loaded skill(s) %s for session %s", _loaded_names, session_key)
         except Exception as e:
             logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
@@ -2040,6 +2027,9 @@ class GatewayTurnMixin:
         persist_user_message: Any
         persist_user_timestamp: Any
         persist_user_display_kind: Optional[str]
+        current_user_text: str
+        reply_to_text: str
+        internal_context: dict
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
         title_user_message: Optional[str] = None
@@ -2068,6 +2058,16 @@ class GatewayTurnMixin:
         context_prompt = self._pinned_session_context_prompt(
             context, _redact_pii, session_key, internal=event.internal,
         )
+
+        # Freeze the instruction before skill, reply, channel, and media context is merged.
+        current_user_text = str(event.text or "")
+        internal_context = {
+            key: value for key, value in {
+                "auto_skill": getattr(event, "auto_skill", None),
+                "channel_context": getattr(event, "channel_context", None),
+                "channel_prompt": getattr(event, "channel_prompt", None),
+            }.items() if value
+        }
 
         # Per-turn notes ride the user message via the api_content sidecar, NOT context_prompt
         # (appending to the ephemeral system prompt forced a full agent rebuild).
@@ -2137,8 +2137,13 @@ class GatewayTurnMixin:
                  if event.message_id else str(uuid.uuid4()))
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
-            persist_user_display_kind, session_entry.session_id, owner,
+            persist_user_display_kind,
+            current_user_text=str(getattr(event, "_gateway_current_user_text", current_user_text) or ""),
+            reply_to_text=str(getattr(event, "reply_to_text", "") or ""),
+            internal_context=internal_context,
+            persistence_session_id=session_entry.session_id, persistence_owner=owner,
             title_user_message=title_user_message,
+
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -2196,6 +2201,10 @@ class GatewayTurnMixin:
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
+                current_user_text=prepared.current_user_text,
+                reply_to_text=prepared.reply_to_text,
+                internal_context=prepared.internal_context,
+
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
@@ -2377,11 +2386,25 @@ class GatewayTurnMixin:
         self, prompt: str, source: "SessionSource", task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        message_type: Optional[MessageType] = None,
+        parent_session_id: Optional[str] = None,
+        parent_session_key: Optional[str] = None,
+        reply_to_text: Optional[str] = None,
+        reply_to_is_own_message: bool = False,
+        auto_skill: Optional[Any] = None,
+        channel_prompt: Optional[str] = None,
+        internal_context: Optional[Dict[str, Any]] = None,
+        origin: Optional[dict] = None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task (mirrors ``_run_agent``)."""
         with self._profile_scope_for_source(source):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt, source, task_id, event_message_id=event_message_id,
+                media_urls=media_urls, media_types=media_types, message_type=message_type,
+                parent_session_id=parent_session_id, parent_session_key=parent_session_key,
+                reply_to_text=reply_to_text, reply_to_is_own_message=reply_to_is_own_message,
+                auto_skill=auto_skill, channel_prompt=channel_prompt,
+                internal_context=internal_context, origin=origin,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -2413,11 +2436,21 @@ class GatewayTurnMixin:
         self, prompt: str, source: "SessionSource", task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        message_type: Optional[MessageType] = None,
+        parent_session_id: Optional[str] = None,
+        parent_session_key: Optional[str] = None,
+        reply_to_text: Optional[str] = None,
+        reply_to_is_own_message: bool = False,
+        auto_skill: Optional[Any] = None,
+        channel_prompt: Optional[str] = None,
+        internal_context: Optional[Dict[str, Any]] = None,
+        origin: Optional[dict] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from gateway.run import (
-            _checkpoint_agent_kwargs, _current_max_iterations, _load_gateway_config,
-            _platform_config_key,
+            _build_auto_skill_context, _checkpoint_agent_kwargs,
+            _compose_gateway_ephemeral_prompt, _current_max_iterations,
+            _event_media_is_image, _load_gateway_config, _platform_config_key,
         )
         from run_agent import AIAgent
         media_urls = media_urls or []
@@ -2444,11 +2477,42 @@ class GatewayTurnMixin:
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
-            # Enrich the prompt with image descriptions (same as the main flow).
+            # Run attachments through the same preprocessors as foreground turns.
             enriched_prompt = prompt
+            normalized_current_user_text = prompt
+            media_event = MessageEvent(
+                text=prompt, message_type=message_type or MessageType.DOCUMENT,
+                source=source, media_urls=media_urls, media_types=media_types,
+            )
+            non_image_urls = [
+                path for i, path in enumerate(media_urls)
+                if not _event_media_is_image(media_event, i)
+            ]
+            non_image_types = [
+                media_types[i] if i < len(media_types) else ""
+                for i, _path in enumerate(media_urls)
+                if not _event_media_is_image(media_event, i)
+            ]
+            if non_image_urls:
+                attachment_event = MessageEvent(
+                    text=prompt, message_type=message_type or MessageType.DOCUMENT,
+                    source=source, media_urls=non_image_urls, media_types=non_image_types,
+                )
+                prepared = await self._prepare_profile_scoped_inbound_message_text(
+                    event=attachment_event, source=source, history=[], session_key=task_id,
+                )
+                if prepared is not None:
+                    enriched_prompt = prepared
+                normalized_current_user_text = str(
+                    getattr(attachment_event, "_gateway_current_user_text", prompt) or ""
+                )
+
+            auto_skill_context, loaded_auto_skills = _build_auto_skill_context(auto_skill, task_id=task_id)
+            if auto_skill_context:
+                enriched_prompt = f"{auto_skill_context}\n\n{enriched_prompt}"
             image_paths = [
                 path for i, path in enumerate(media_urls)
-                if (media_types[i] if i < len(media_types) else "").startswith("image/")
+                if _event_media_is_image(media_event, i)
             ]
             if image_paths:
                 try:
@@ -2456,7 +2520,28 @@ class GatewayTurnMixin:
                 except Exception as e:
                     logger.warning("Background task vision enrichment failed: %s", e)
 
+            structured_internal_context = dict(internal_context or {})
+            if loaded_auto_skills:
+                structured_internal_context["auto_skill"] = loaded_auto_skills
+            channel_context = str(structured_internal_context.get("channel_context") or "")
+            if channel_context:
+                enriched_prompt = f"{channel_context}\n\n[New message]\n{enriched_prompt}"
+            reply_context = str(reply_to_text or "")
+            if reply_context:
+                reply_label = "Replying to your previous message" if reply_to_is_own_message else "Replying to"
+                enriched_prompt = f'[{reply_label}: "{reply_context}"]\n\n{enriched_prompt}'
+
+            context = build_session_context(source, getattr(self, "config", None))
+            redact_pii = bool((user_config.get("privacy") or {}).get("redact_pii", False))
+            context_prompt = _compose_gateway_ephemeral_prompt(
+                self, source=source,
+                context_prompt=build_session_context_prompt(context, redact_pii=redact_pii),
+                channel_prompt=channel_prompt,
+            )
+
             def run_sync():
+                if bool(parent_session_id) != bool(parent_session_key):
+                    raise RuntimeError("Background parent session metadata is incomplete")
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -2480,13 +2565,20 @@ class GatewayTurnMixin:
                     **{k: getattr(source, k) for k in (
                         "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id",
                     )},
+                    parent_session_id=parent_session_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot.
                     # See #60955.
                     fallback_model=self._refresh_fallback_model(),
                 )
                 try:
-                    return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
+                    if parent_session_id and parent_session_key:
+                        agent.record_gateway_session_peer(origin=origin, routable=False)
+                    return agent.run_conversation(
+                        user_message=enriched_prompt, system_message=context_prompt, task_id=task_id,
+                        current_user_text=normalized_current_user_text,
+                        reply_to_text=reply_context, internal_context=structured_internal_context,
+                    )
                 finally:
                     self._cleanup_agent_resources(agent)
 
@@ -3862,6 +3954,10 @@ class GatewayTurnMixin:
         next_persist_message = None
         next_display_kind = display_kind_for_event(pending_event)
         next_reply_expected = pending_event.reply_expected if pending_event is not None else None
+        next_current_user_text = str(pending or "")
+        next_reply_to_text = ""
+        next_internal_context: Dict[str, Any] = {}
+
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
@@ -3887,6 +3983,17 @@ class GatewayTurnMixin:
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
+            next_current_user_text = str(
+                getattr(pending_event, "_gateway_current_user_text", getattr(pending_event, "text", "")) or ""
+            )
+            next_reply_to_text = str(getattr(pending_event, "reply_to_text", "") or "")
+            next_internal_context = {
+                key: value for key, value in {
+                    "auto_skill": getattr(pending_event, "auto_skill", None),
+                    "channel_context": getattr(pending_event, "channel_context", None),
+                    "channel_prompt": getattr(pending_event, "channel_prompt", None),
+                }.items() if value
+            }
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
             next_channel_prompt, next_source = self._pinned_channel_inputs(
@@ -3941,6 +4048,8 @@ class GatewayTurnMixin:
 
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
+                current_user_text=next_current_user_text, reply_to_text=next_reply_to_text,
+                internal_context=next_internal_context,
                 source=next_source, session_id=session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
@@ -3961,6 +4070,7 @@ class GatewayTurnMixin:
             raise
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
@@ -4278,6 +4388,9 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        current_user_text: Optional[str] = None, reply_to_text: Optional[str] = None,
+        internal_context: Optional[dict] = None,
+
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4311,6 +4424,9 @@ class GatewayTurnMixin:
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,
+            current_user_text=current_user_text, reply_to_text=reply_to_text,
+            internal_context=dict(internal_context or {}),
+
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,

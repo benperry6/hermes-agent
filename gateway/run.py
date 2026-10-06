@@ -28,7 +28,7 @@ from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Tuple, cast
+from typing import Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
@@ -111,6 +111,50 @@ _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
 _HYGIENE_COOLDOWN_MAX_SECONDS = 3600.0
 # Flat retry-after when hygiene is ABANDONED by turn-hold expiry (not a failure: outside the streak ladder).
 _HYGIENE_TURNHOLD_RETRY_SECONDS = 60.0
+
+
+def _build_auto_skill_context(
+    auto_skill: Optional[Union[str, List[str]]], *, task_id: str,
+) -> Tuple[str, List[str]]:
+    """Render topic/channel auto-skills for every gateway execution path."""
+    if not auto_skill:
+        return "", []
+    from agent.skill_commands import _build_skill_message, _load_skill_payload
+
+    names = [auto_skill] if isinstance(auto_skill, str) else list(auto_skill)
+    parts: List[str] = []
+    loaded_names: List[str] = []
+    for name in names:
+        loaded = _load_skill_payload(name, task_id=task_id)
+        if not loaded:
+            logger.warning("[Gateway] Auto-skill '%s' not found", name)
+            continue
+        skill, skill_dir, display_name = loaded
+        note = (
+            f'[IMPORTANT: The "{display_name}" skill is auto-loaded. '
+            "Follow its instructions for this session.]"
+        )
+        rendered = _build_skill_message(skill, skill_dir, note)
+        if rendered:
+            parts.append(rendered)
+            loaded_names.append(name)
+    return "\n\n".join(parts), loaded_names
+
+
+def _compose_gateway_ephemeral_prompt(
+    runner, *, source, context_prompt: Optional[str] = None,
+    channel_prompt: Optional[str] = None,
+) -> str:
+    """Compose per-turn gateway context identically for every execution path."""
+    parts = [str(context_prompt or "").strip(), str(channel_prompt or "").strip()]
+    configured = runner._get_system_prompt_for_channel(
+        source.platform,
+        source.chat_id or "",
+        thread_id=getattr(source, "thread_id", None),
+        parent_id=getattr(source, "parent_chat_id", None),
+    )
+    parts.append(str(configured or "").strip())
+    return "\n\n".join(part for part in parts if part)
 
 
 def _gateway_session_db_inner(gateway):

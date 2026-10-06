@@ -1695,13 +1695,20 @@ class TurnRunner:
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
-            kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
+            kwargs = {
+                "conversation_history": agent_history, "task_id": ctx.session_id,
+                "current_user_text": ctx.current_user_text,
+                "reply_to_text": ctx.reply_to_text,
+                "internal_context": ctx.internal_context,
+            }
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
                 kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
                                          "is_bot": bool(getattr(ctx.source, "is_bot", False))}
             if ctx.title_user_message is not None:
                 kwargs["title_user_message"] = ctx.title_user_message
+
+
             if persist_user_message_override is not None:
                 kwargs["persist_user_message"] = persist_user_message_override
             elif observed_group_context:
@@ -1840,18 +1847,12 @@ class TurnRunner:
     def _combined_ephemeral_prompt(self) -> str:
         """Platform context + YAML channel_prompts hint + channel_overrides system_prompt (or global
         ephemeral) + the gateway ephemeral prompt."""
+        from gateway.run import _compose_gateway_ephemeral_prompt
         ctx = self._ctx
-        combined = ctx.context_prompt or ""
-        for extra in (
-            (ctx.channel_prompt or "").strip(),
-            self._runner._get_system_prompt_for_channel(
-                ctx.source.platform, ctx.source.chat_id or "", thread_id=getattr(ctx.source, "thread_id", None),
-                parent_id=getattr(ctx.source, "parent_chat_id", None),
-            ),
-        ):
-            if extra:
-                combined = (combined + "\n\n" + extra).strip()
-        return combined
+        return _compose_gateway_ephemeral_prompt(
+            self._runner, source=ctx.source, context_prompt=ctx.context_prompt,
+            channel_prompt=ctx.channel_prompt,
+        )
 
     def _append_auto_media_tags(self, final_response: str, result, agent_history, history_media_paths) -> str:
         """Append MEDIA:<path> tags from tool results (e.g. TTS) that the model's final text omits, so
