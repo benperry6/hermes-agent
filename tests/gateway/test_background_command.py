@@ -87,10 +87,18 @@ class TestHandleBackgroundCommand:
     @pytest.mark.parametrize("reply_padding", [0, 499, 700, 4096])
     async def test_passes_parent_and_complete_reply_context(self, reply_padding):
         runner = _make_runner()
-        parent = MagicMock(session_id="parent-session")
-        runner.session_store.get_or_create_session.return_value = parent
-        runner._run_background_task = AsyncMock(return_value=None)
         event = _make_event(text="/bg inspect this")
+        parent_key = runner._session_key_for_source(event.source)
+        parent = MagicMock(session_id="parent-session", session_key=parent_key)
+        async_store = AsyncMock()
+        async_store._store = runner.session_store
+        async_store.get_or_create_session.return_value = parent
+        async_store.load_transcript.return_value = [
+            {"role": "user", "content": "Original parent request"},
+            {"role": "assistant", "content": "Original parent response"},
+        ]
+        runner._async_session_store = async_store
+        runner._run_background_task = AsyncMock(return_value=None)
         decision_after_old_limit = "APPROVE_THE_REPORT_AFTER_CHARACTER_500"
         event.reply_to_text = "q" * reply_padding + decision_after_old_limit
         event.reply_to_is_own_message = True
@@ -105,6 +113,10 @@ class TestHandleBackgroundCommand:
         kwargs = runner._run_background_task.await_args.kwargs
         assert kwargs["parent_session_id"] == "parent-session"
         assert kwargs["parent_session_key"] == runner._session_key_for_source(event.source)
+        assert kwargs["parent_conversation_history"] == [
+            {"role": "user", "content": "Original parent request"},
+            {"role": "assistant", "content": "Original parent response"},
+        ]
         assert kwargs["reply_to_text"] == event.reply_to_text
         assert decision_after_old_limit in kwargs["reply_to_text"]
         assert kwargs["reply_to_is_own_message"] is True
@@ -116,6 +128,98 @@ class TestHandleBackgroundCommand:
         assert kwargs["origin"]["execution_kind"] == "user_explicit_background"
         assert kwargs["origin"]["user_initiated"] is True
         assert kwargs["origin"]["command"] == "/bg"
+
+    @pytest.mark.asyncio
+    async def test_refuses_parent_from_another_topic(self):
+        runner = _make_runner()
+        event = _make_event(text="/bg inspect this")
+        event.source.thread_id = "expected-topic"
+        async_store = AsyncMock()
+        async_store._store = runner.session_store
+        async_store.get_or_create_session.return_value = MagicMock(
+            session_id="other-topic-session",
+            session_key="telegram:67890:other-topic",
+        )
+        runner._async_session_store = async_store
+        runner._run_background_task = AsyncMock(return_value=None)
+
+        result = await runner._handle_background_command(event)
+
+        assert "not started" in result.lower()
+        async_store.load_transcript.assert_not_called()
+        runner._run_background_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_parent_read_failure_is_explicit(self):
+        runner = _make_runner()
+        event = _make_event(text="/bg inspect this")
+        parent_key = runner._session_key_for_source(event.source)
+        async_store = AsyncMock()
+        async_store._store = runner.session_store
+        async_store.get_or_create_session.return_value = MagicMock(
+            session_id="parent-session", session_key=parent_key
+        )
+        async_store.load_transcript.side_effect = RuntimeError("database unreadable")
+        runner._async_session_store = async_store
+        runner._run_background_task = AsyncMock(return_value=None)
+
+        result = await runner._handle_background_command(event)
+
+        assert "not started" in result.lower()
+        assert "could not be read" in result.lower()
+        runner._run_background_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_long_parent_snapshots_only_native_compression_tip(self, tmp_path):
+        from gateway.session import AsyncSessionStore, SessionStore
+        from hermes_state import SessionDB
+
+        runner = _make_runner()
+        store = SessionStore(tmp_path / "sessions", GatewayConfig())
+        if store._db is not None:
+            store._db.close()
+        store._db = SessionDB(db_path=tmp_path / "state.db")
+        runner.session_store = store
+        runner._async_session_store = AsyncSessionStore(store)
+        runner._run_background_task = AsyncMock(return_value=None)
+        event = _make_event(text="/bg current instruction")
+        try:
+            entry = store.get_or_create_session(event.source)
+            old_history = [
+                {"role": "user", "content": f"old request {i}"}
+                if i % 2 == 0
+                else {"role": "assistant", "content": f"old answer {i}"}
+                for i in range(240)
+            ]
+            store._db.append_messages_batch(entry.session_id, old_history)
+            store._db.end_session(entry.session_id, "compression")
+            tip_id = "compressed-parent-tip"
+            store._db.create_session(
+                tip_id,
+                source="telegram",
+                parent_session_id=entry.session_id,
+            )
+            store._db.append_messages_batch(
+                tip_id,
+                [
+                    {"role": "user", "content": "compressed summary"},
+                    {"role": "assistant", "content": "recent context"},
+                ],
+            )
+
+            result = await runner._handle_background_command(event)
+            await asyncio.sleep(0)
+
+            assert "Background" in result
+            snapshot = runner._run_background_task.await_args.kwargs[
+                "parent_conversation_history"
+            ]
+            assert [message["content"] for message in snapshot] == [
+                "compressed summary",
+                "recent context",
+            ]
+        finally:
+            store._db.close()
 
     @pytest.mark.parametrize("spelling", ["bg", "background"])
     def test_bg_and_background_resolve_to_same_gateway_command(self, spelling):
@@ -164,11 +268,7 @@ class TestRunBackgroundTask:
             {"role": "user", "content": "Original parent request"},
             {"role": "assistant", "content": "Original parent response"},
         ]
-        runner._session_db = MagicMock()
-        runner._session_db._db = runner._session_db
-        runner._session_db.get_session.return_value = {"id": "parent-session"}
-        runner._session_db.get_compression_tip.return_value = "parent-session"
-        runner._session_db.get_messages_as_conversation.return_value = parent_history
+        child_history = [dict(message) for message in parent_history]
 
         source = SessionSource(
             platform=Platform.TELEGRAM,
@@ -210,6 +310,8 @@ class TestRunBackgroundTask:
             mock_agent_instance = MagicMock()
             mock_agent_instance.shutdown_memory_provider = MagicMock()
             mock_agent_instance.close = MagicMock()
+            mock_agent_instance._session_db = MagicMock()
+            mock_agent_instance._session_db.get_messages_as_conversation.return_value = child_history
             mock_agent_instance.run_conversation.return_value = mock_result
             MockAgent.return_value = mock_agent_instance
 
@@ -221,6 +323,7 @@ class TestRunBackgroundTask:
                 "bg_test",
                 parent_session_id="parent-session",
                 parent_session_key="telegram:67890",
+                parent_conversation_history=parent_history,
                 reply_to_text=complete_reply,
                 reply_to_is_own_message=True,
                 auto_skill=["arbitrary-topic-skill"],
@@ -274,6 +377,9 @@ class TestRunBackgroundTask:
         assert origin["execution_kind"] == "user_explicit_background"
         assert origin["user_initiated"] is True
         assert origin["command"] == "/bg"
+        mock_agent_instance._session_db.append_messages_batch.assert_called_once_with(
+            "bg_test", parent_history, chunk_rows=500
+        )
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
@@ -318,7 +424,7 @@ class TestRunBackgroundTask:
         assert prepared_event.media_types == [media_type]
         assert prepared_event.message_type == message_type
         user_message = agent.run_conversation.call_args.kwargs["user_message"]
-        assert "conversation_history" not in agent.run_conversation.call_args.kwargs
+        assert agent.run_conversation.call_args.kwargs["conversation_history"] is None
         assert prepared_marker in user_message.lower()
         assert path in user_message
 
@@ -345,10 +451,8 @@ class TestRunBackgroundTask:
             )
 
         MockAgent.assert_not_called()
-        # Preserve official diagnostic privacy: no exception/session id is echoed.
-        adapter.send.assert_not_called()
-        adapter.emit_warning.assert_awaited_once()
-        assert "inspect parent context" in adapter.emit_warning.await_args.args[1]
+        assert "parent context snapshot" in adapter.send.call_args.kwargs["content"].lower()
+
 
     @pytest.mark.asyncio
     async def test_generic_caller_supplies_its_own_provenance(self):
@@ -358,14 +462,6 @@ class TestRunBackgroundTask:
         mock_adapter.extract_media = MagicMock(return_value=([], "done"))
         mock_adapter.extract_images = MagicMock(return_value=([], "done"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
-        runner._session_db = MagicMock()
-        runner._session_db._db = runner._session_db
-        runner._session_db.get_session.return_value = {"id": "parent-session"}
-        runner._session_db.get_compression_tip.return_value = "compression-tip"
-        runner._session_db.get_session.side_effect = lambda session_id: (
-            {"id": session_id} if session_id in {"parent-session", "compression-tip"} else None
-        )
-        runner._session_db.get_messages_as_conversation.return_value = []
         source = _make_event().source
         caller_origin = {"execution_kind": "scheduled_background"}
 
@@ -373,6 +469,8 @@ class TestRunBackgroundTask:
              patch("gateway.run._load_gateway_config", return_value={}), \
              patch("run_agent.AIAgent") as MockAgent:
             agent = MockAgent.return_value
+            agent._session_db = MagicMock()
+            agent._session_db.get_messages_as_conversation.return_value = []
             agent.run_conversation.return_value = {"final_response": "done", "messages": []}
             await runner._run_background_task(
                 "scheduled work",
@@ -380,6 +478,7 @@ class TestRunBackgroundTask:
                 "bg_other",
                 parent_session_id="parent-session",
                 parent_session_key="telegram:67890",
+                parent_conversation_history=[],
                 origin=caller_origin,
             )
 
@@ -388,9 +487,6 @@ class TestRunBackgroundTask:
             "routable": False,
         }
         assert "command" not in caller_origin
-        runner._session_db.get_messages_as_conversation.assert_called_once_with(
-            "compression-tip", repair_alternation=True
-        )
 
     @pytest.mark.asyncio
     async def test_peer_record_failure_still_cleans_up_agent(self):
@@ -399,11 +495,6 @@ class TestRunBackgroundTask:
         mock_adapter.send = AsyncMock()
         mock_adapter.emit_warning = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = mock_adapter
-        runner._session_db = MagicMock()
-        runner._session_db._db = runner._session_db
-        runner._session_db.get_session.return_value = {"id": "parent-session"}
-        runner._session_db.get_compression_tip.return_value = "parent-session"
-        runner._session_db.get_messages_as_conversation.return_value = []
         source = _make_event().source
 
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
@@ -420,6 +511,7 @@ class TestRunBackgroundTask:
                 "bg_failure",
                 parent_session_id="parent-session",
                 parent_session_key="telegram:67890",
+                parent_conversation_history=[],
                 origin={"execution_kind": "scheduled_background"},
             )
 
@@ -432,29 +524,6 @@ class TestRunBackgroundTask:
         mock_adapter.emit_warning.assert_awaited_once()
         assert mock_adapter.emit_warning.await_args.args[0] == source.chat_id
         assert "scheduled work" in mock_adapter.emit_warning.await_args.args[1]
-
-
-def test_background_parent_history_bound_does_not_split_tool_pairs():
-    from gateway.run import _bounded_background_parent_history
-
-    history = [
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
-        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
-        {"role": "assistant", "content": "recent answer"},
-        {"role": "user", "content": "recent request"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2"}]},
-        {"role": "tool", "tool_call_id": "call-2", "content": "recent result"},
-        {"role": "assistant", "content": "latest answer"},
-    ]
-
-    bounded = _bounded_background_parent_history(history, max_messages=6)
-
-    assert len(bounded) <= 6
-    assert bounded[-1]["content"] == "latest answer"
-    assert not any(message.get("tool_call_id") == "call-1" for message in bounded)
-    assert any(message.get("tool_calls") == [{"id": "call-2"}] for message in bounded)
-    assert any(message.get("tool_call_id") == "call-2" for message in bounded)
 
 
 class TestAIAgentGatewayPeerContract:
@@ -725,7 +794,7 @@ async def test_background_preserves_delivery_for_narrow_agent_signature():
     runner.adapters[Platform.TELEGRAM] = adapter
     source = _make_event().source
     calls = []
-    def narrow_run(user_message, task_id):
+    def narrow_run(user_message, task_id, conversation_history=None):
         calls.append((user_message,task_id))
         return {"final_response":"narrow callable complete","messages":[]}
     with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key":"test-key"}), patch("gateway.run._load_gateway_config",return_value={}), patch("run_agent.AIAgent") as Factory:

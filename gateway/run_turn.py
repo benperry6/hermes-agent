@@ -2389,6 +2389,7 @@ class GatewayTurnMixin:
         message_type: Optional[MessageType] = None,
         parent_session_id: Optional[str] = None,
         parent_session_key: Optional[str] = None,
+        parent_conversation_history: Optional[List[Dict[str, Any]]] = None,
         reply_to_text: Optional[str] = None,
         reply_to_is_own_message: bool = False,
         auto_skill: Optional[Any] = None,
@@ -2402,6 +2403,7 @@ class GatewayTurnMixin:
                 prompt, source, task_id, event_message_id=event_message_id,
                 media_urls=media_urls, media_types=media_types, message_type=message_type,
                 parent_session_id=parent_session_id, parent_session_key=parent_session_key,
+                parent_conversation_history=parent_conversation_history,
                 reply_to_text=reply_to_text, reply_to_is_own_message=reply_to_is_own_message,
                 auto_skill=auto_skill, channel_prompt=channel_prompt,
                 internal_context=internal_context, origin=origin,
@@ -2439,6 +2441,7 @@ class GatewayTurnMixin:
         message_type: Optional[MessageType] = None,
         parent_session_id: Optional[str] = None,
         parent_session_key: Optional[str] = None,
+        parent_conversation_history: Optional[List[Dict[str, Any]]] = None,
         reply_to_text: Optional[str] = None,
         reply_to_is_own_message: bool = False,
         auto_skill: Optional[Any] = None,
@@ -2460,6 +2463,19 @@ class GatewayTurnMixin:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+
+        if bool(parent_session_id) != bool(parent_session_key) or (
+            parent_session_id and parent_conversation_history is None
+        ):
+            await adapter.send(
+                chat_id=source.chat_id,
+                content=(
+                    f"❌ Background task {task_id} failed: required parent context "
+                    "snapshot is missing or incomplete."
+                ),
+                metadata=_thread_metadata,
+            )
+            return
 
         try:
             user_config = _load_gateway_config()
@@ -2542,22 +2558,6 @@ class GatewayTurnMixin:
             def run_sync():
                 if bool(parent_session_id) != bool(parent_session_key):
                     raise RuntimeError("Background parent session metadata is incomplete")
-                parent_history = None
-                session_db = getattr(self._session_db, "_db", self._session_db)
-                if parent_session_id:
-                    from gateway.run import _bounded_background_parent_history
-                    if session_db is None:
-                        raise RuntimeError("Background parent session database is unavailable")
-                    if session_db.get_session(parent_session_id) is None:
-                        raise RuntimeError(f"Background parent session {parent_session_id!r} not found")
-                    parent_tip = session_db.get_compression_tip(parent_session_id)
-                    if not parent_tip:
-                        raise RuntimeError(f"Background parent session {parent_session_id!r} has no valid compression tip")
-                    if parent_tip != parent_session_id and session_db.get_session(parent_tip) is None:
-                        raise RuntimeError(f"Background parent compression tip {parent_tip!r} not found")
-                    parent_history = _bounded_background_parent_history(
-                        session_db.get_messages_as_conversation(parent_tip, repair_alternation=True)
-                    )
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -2588,19 +2588,40 @@ class GatewayTurnMixin:
                     fallback_model=self._refresh_fallback_model(),
                 )
                 try:
+                    conversation_history = None
                     if parent_session_id and parent_session_key:
                         agent.record_gateway_session_peer(origin=origin, routable=False)
+                        if agent._session_db is None:
+                            raise RuntimeError(
+                                "Background child session DB unavailable for parent snapshot"
+                            )
+                        if parent_conversation_history:
+                            agent._session_db.append_messages_batch(
+                                task_id,
+                                parent_conversation_history,
+                                chunk_rows=500,
+                            )
+                        conversation_history = agent._session_db.get_messages_as_conversation(
+                            task_id,
+                            repair_alternation=True,
+                        )
+                        if parent_conversation_history and not conversation_history:
+                            raise RuntimeError(
+                                "Background parent context snapshot was not persisted"
+                            )
                     from gateway.run import _supported_optional_kwargs
                     conversation_kwargs = {"task_id": task_id}
-                    if parent_history is not None:
-                        conversation_kwargs["conversation_history"] = parent_history
                     conversation_kwargs.update(_supported_optional_kwargs(agent.run_conversation, {
                         "system_message": context_prompt,
                         "current_user_text": normalized_current_user_text,
                         "reply_to_text": reply_context,
                         "internal_context": structured_internal_context,
                     }))
-                    return agent.run_conversation(user_message=enriched_prompt, **conversation_kwargs)
+                    return agent.run_conversation(
+                        user_message=enriched_prompt,
+                        conversation_history=conversation_history,
+                        **conversation_kwargs,
+                    )
                 finally:
                     self._cleanup_agent_resources(agent)
 
