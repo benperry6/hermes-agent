@@ -167,19 +167,89 @@ def test_final_response_missing_receipt_directory_refuses_before_send(fake_tool,
 
 
 def test_final_response_ambiguous_identifier_never_silences_gateway(fake_tool, monkeypatch, tmp_path):
+    from agent.external_delivery import consume_external_delivery_receipts, external_delivery_receipt_path
     from gateway.response_filters import is_completed_external_delivery_result
 
     monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
-    path = tmp_path / "receipt.json"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = external_delivery_receipt_path("session", "turn", "call-ambiguous")
+    path.parent.mkdir(parents=True)
     monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
     fake_tool.payload = {"success": True, "platform": "telegram", "chat_id": "-1001", "message_id": True}
     with pytest.raises(SystemExit) as exc:
         send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "reply"]))
     assert exc.value.code == 1 and len(fake_tool.calls) == 1 and not path.exists()
+    call = SimpleNamespace(id="call-ambiguous", function=SimpleNamespace(name="terminal"))
+    receipts = consume_external_delivery_receipts(
+        session_id="session", turn_id="turn", tool_calls=[call],
+        messages=[{"role": "tool", "tool_call_id": "call-ambiguous",
+                   "content": json.dumps({"exit_code": exc.value.code, "error": None})}],
+    )
+    assert not receipts
     assert not is_completed_external_delivery_result({
         "final_response": "NO_REPLY", "failed": False, "completed": True,
-        "external_deliveries": [],
+        "external_deliveries": receipts,
     })
+
+
+@pytest.mark.parametrize("text,allowed", [
+    ("a" * 4096, True),
+    ("😀" * 2048, True),
+    ("😀" * 2048 + "a", False),
+    ("." * 3000, False),
+])
+def test_final_response_uses_sender_formatted_utf16_one_bubble_bound(
+    fake_tool, monkeypatch, tmp_path, text, allowed,
+):
+    from gateway.platforms.base import BasePlatformAdapter, utf16_len
+    from tools.send_message_senders import _telegram_format
+
+    formatted = _telegram_format(text)[0]
+    assert (len(BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len)) == 1) == allowed
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    path = tmp_path / "receipt.json"
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
+    fake_tool.payload = {"success": True, "platform": "telegram", "chat_id": "-1001", "message_id": "m123"}
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", text]))
+    assert exc.value.code == (0 if allowed else 2)
+    assert (len(fake_tool.calls) == 1) == allowed
+    assert path.exists() == allowed
+
+
+def test_final_response_write_error_removes_partial_receipt(fake_tool, monkeypatch, tmp_path):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    path = tmp_path / "receipt.json"
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", str(path))
+    fake_tool.payload = {"success": True, "platform": "telegram", "chat_id": "-1001", "message_id": "m123"}
+
+    def partial_dump(_payload, stream):
+        stream.write("{")
+        raise OSError("simulated disk write failure")
+
+    monkeypatch.setattr(send_cmd.json, "dump", partial_dump)
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "reply"]))
+    assert exc.value.code == 1 and len(fake_tool.calls) == 1 and not path.exists()
+
+
+@pytest.mark.parametrize("kind", ["relative", "wrong_suffix", "dangling_symlink"])
+def test_final_response_rejects_unusable_receipt_path_before_send(
+    fake_tool, monkeypatch, tmp_path, kind,
+):
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    if kind == "relative":
+        path = "receipt.json"
+    elif kind == "wrong_suffix":
+        path = str(tmp_path / "receipt.txt")
+    else:
+        link = tmp_path / "receipt.json"
+        link.symlink_to(tmp_path / "missing.json")
+        path = str(link)
+    monkeypatch.setenv("HERMES_TURN_RECEIPT_FILE", path)
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:-1001:8372", "--final-response", "reply"]))
+    assert exc.value.code == 2 and not fake_tool.calls
 
 
 
