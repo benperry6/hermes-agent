@@ -1991,6 +1991,10 @@ class TurnRunner:
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
             "turn_exit_reason": result.get("turn_exit_reason"),
+            # Keep the verified terminal receipt paired with its completion verdict; the
+            # human-turn guard must distinguish delivery from a model's bare NO_REPLY.
+            **({key: result[key] for key in ("delivery_already_sent", "external_deliveries")
+               if key in result}),
             # Explicit non-persistence must survive empty-response recovery too.
             **({"agent_persisted": result["agent_persisted"]} if "agent_persisted" in result else {}),
             "compression_exhausted": result.get("compression_exhausted", False),

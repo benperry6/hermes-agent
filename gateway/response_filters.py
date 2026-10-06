@@ -96,18 +96,24 @@ def is_autonomous_silence_response(response: Any) -> bool:
     )
 
 
-def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
-    """Silence markers suppress delivery only for successful agent turns."""
+def is_completed_external_delivery_result(agent_result: dict | None) -> bool:
+    """The agent's terminal receipt path already delivered this turn's answer."""
     if not isinstance(agent_result, dict) or agent_result.get("failed"):
         return False
-    if agent_result.get("delivery_already_sent") is True:
-        receipts = agent_result.get("external_deliveries")
-        return (
-            agent_result.get("turn_exit_reason") == "external_delivery_complete"
-            and agent_result.get("completed") is True
-            and isinstance(receipts, list) and bool(receipts)
-        )
-    return is_intentional_silence_response(response)
+    receipts = agent_result.get("external_deliveries")
+    return (
+        agent_result.get("delivery_already_sent") is True
+        and agent_result.get("turn_exit_reason") == "external_delivery_complete"
+        and agent_result.get("completed") is True
+        and isinstance(receipts, list) and bool(receipts)
+    )
+
+
+def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
+    """A completed external delivery or a model silence marker on a successful turn."""
+    if not isinstance(agent_result, dict) or agent_result.get("failed"):
+        return False
+    return is_completed_external_delivery_result(agent_result) or is_intentional_silence_response(response)
 
 
 def display_kind_for_event(event: Any) -> str | None:
