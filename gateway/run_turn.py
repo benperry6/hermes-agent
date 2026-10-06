@@ -2542,6 +2542,22 @@ class GatewayTurnMixin:
             def run_sync():
                 if bool(parent_session_id) != bool(parent_session_key):
                     raise RuntimeError("Background parent session metadata is incomplete")
+                parent_history = None
+                session_db = getattr(self._session_db, "_db", self._session_db)
+                if parent_session_id:
+                    from gateway.run import _bounded_background_parent_history
+                    if session_db is None:
+                        raise RuntimeError("Background parent session database is unavailable")
+                    if session_db.get_session(parent_session_id) is None:
+                        raise RuntimeError(f"Background parent session {parent_session_id!r} not found")
+                    parent_tip = session_db.get_compression_tip(parent_session_id)
+                    if not parent_tip:
+                        raise RuntimeError(f"Background parent session {parent_session_id!r} has no valid compression tip")
+                    if parent_tip != parent_session_id and session_db.get_session(parent_tip) is None:
+                        raise RuntimeError(f"Background parent compression tip {parent_tip!r} not found")
+                    parent_history = _bounded_background_parent_history(
+                        session_db.get_messages_as_conversation(parent_tip, repair_alternation=True)
+                    )
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -2576,6 +2592,8 @@ class GatewayTurnMixin:
                         agent.record_gateway_session_peer(origin=origin, routable=False)
                     from gateway.run import _supported_optional_kwargs
                     conversation_kwargs = {"task_id": task_id}
+                    if parent_history is not None:
+                        conversation_kwargs["conversation_history"] = parent_history
                     conversation_kwargs.update(_supported_optional_kwargs(agent.run_conversation, {
                         "system_message": context_prompt,
                         "current_user_text": normalized_current_user_text,
