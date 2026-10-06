@@ -120,23 +120,24 @@ class OnePasswordLoginBackend(LoginBackend):
 
         The same helper backs both ``has_otp`` (the agent's "codes are minted automatically"
         hint) and ``resolve_otp``, so a stored item is never announced as automatic unless a
-        code can actually be minted from it. The value is therefore accepted only when it
-        normalizes AND the shared minter can really run on it: the base32 alphabet check alone
-        would accept an alphabet-valid but undecodable secret (e.g. "A"), or a period too large
-        for the runtime division, and announce a capability the backend cannot deliver.
+        code can actually be minted from it. Every eligible field is examined: an unusable
+        candidate (blank, unnormalisable, or one the minter rejects) must not hide a later
+        usable seed — the base32 alphabet check alone would accept an alphabet-valid but
+        undecodable secret (e.g. "A"), or a period too large for the runtime division.
         """
-        raw = next((f.get("value") for f in item.get("fields", [])
-                    if f.get("type") == "OTP" or f.get("purpose") == "ONE_TIME_PASSWORD"), None)
-        if not isinstance(raw, str) or not raw.strip():
-            return None
-        try:
-            seed = normalize_otp_secret(raw)
-            if not seed:
-                return None
-            totp_now(seed)  # fail closed: no mintable seed, no automatic-2FA claim
-            return seed
-        except Exception:
-            return None
+        for field in item.get("fields", []):
+            if field.get("type") != "OTP" and field.get("purpose") != "ONE_TIME_PASSWORD":
+                continue
+            raw = field.get("value")
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            try:
+                seed = normalize_otp_secret(raw)
+                if seed and totp_now(seed):  # fail closed: no mintable seed, no claim
+                    return seed
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def _connect_meta(item, vault_id):
@@ -144,14 +145,16 @@ class OnePasswordLoginBackend(LoginBackend):
         OnePasswordLoginBackend._connect_ids(handle)
         urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
         origins = _all_origins(urls)
-        origin = origins[0] if origins else None
-        if not origin:
+        if not origins:
+
             return None
+        origin = origins[0]
         username = next((f.get("value") for f in item.get("fields", []) if f.get("purpose") == "USERNAME"), None)
         return VaultItemMeta(id=handle, kind="login", label=str(item.get("title") or origin),
                              has_otp=OnePasswordLoginBackend._connect_otp_seed(item) is not None,
                              origin=origin, created_at=str(item.get("createdAt") or ""),
-                             identifier_type="username" if username else None, identifier=username)
+                             identifier_type="username" if username else None, identifier=username,
+                             allowed_origins=_web_origins(origins))
 
     def is_unlocked(self) -> bool:
         try:
