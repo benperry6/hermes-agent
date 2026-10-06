@@ -61,6 +61,8 @@ def _mock_plugin_discovery(monkeypatch):
     # Tool definitions are supplied by these unit fixtures. Scanning every
     # bundled plugin again for each isolated test home adds no coverage.
     monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    # Lifecycle hooks discover lazily through the manager, bypassing that facade.
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager.discover_and_load", lambda self: None)
 
 
 @pytest.fixture()
