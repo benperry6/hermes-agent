@@ -172,7 +172,7 @@ def _background_delete_gate(store, action, operations, target="memory", content=
                             old_text=None) -> Optional[str]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
     stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
-    single or inside a batch — are never applied unattended. The op is staged in the pending
+    single or inside a batch — require explicit configuration consent. Otherwise the op is staged in the pending
     store instead of merely denied: the fork's own review summary is never published back, so
     a plain denial would drop the consolidation request with no surfacing path at all. A
     staging failure fails closed to a plain denial."""
@@ -180,10 +180,14 @@ def _background_delete_gate(store, action, operations, target="memory", content=
 
     if not is_unattended_review():
         return None
+
     payload = ({"action": "batch", "target": target, "operations": operations}
                if operations is not None else
                {"action": action, "target": target, "content": content, "old_text": old_text})
     if not destructive_ops(payload):
+        return None
+    # Explicit opt-in only; general approval and native target pinning still apply.
+    if get_builtin_memory_config().get("allow_unattended_consolidation") is True:
         return None
     detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
               else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
