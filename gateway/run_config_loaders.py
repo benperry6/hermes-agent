@@ -159,6 +159,30 @@ class GatewayConfigLoadersMixin:
         return resolve_reasoning_config(_load_gateway_config(), model)
 
     @staticmethod
+    def _load_topic_reasoning_config(source: Optional[SessionSource]) -> dict | None:
+        """Configured Telegram topic default, or ``None`` when this source has none."""
+        if (
+            source is None
+            or source.platform != Platform.TELEGRAM
+            or not source.chat_id
+            or source.thread_id in (None, "")
+        ):
+            return None
+        from gateway.run import _load_gateway_config
+        from hermes_constants import parse_reasoning_effort
+
+        overrides = cfg_get(
+            _load_gateway_config(), "agent", "reasoning_effort_overrides", default={}
+        )
+        key = f"{source.chat_id}:{source.thread_id}"
+        if not isinstance(overrides, dict) or key not in overrides:
+            return None
+        topic_reasoning = parse_reasoning_effort(overrides[key])
+        if topic_reasoning is None:
+            logger.warning("Unknown reasoning_effort_overrides value for Telegram topic %s", key)
+        return topic_reasoning
+
+    @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
         """Parse `/reasoning` args into `(value, persist_global)`; `--global` anywhere persists to config."""
         import shlex
@@ -176,16 +200,20 @@ class GatewayConfigLoadersMixin:
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         model: str = "",
     ) -> dict | None:
-        """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
+        """Session override > Telegram topic default > per-model default > global default.
 
-        ``model`` must be the session's *effective* model (session ``/model`` override included);
-        empty uses ``model.default``.
+        Telegram topic defaults use ``agent.reasoning_effort_overrides`` keys shaped as
+        ``<chat_id>:<thread_id>``. ``model`` must be the session's effective model; empty uses
+        ``model.default``.
         """
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
         if resolved_session_key:
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+        topic_reasoning = self._load_topic_reasoning_config(source)
+        if topic_reasoning is not None:
+            return topic_reasoning
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:

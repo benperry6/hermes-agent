@@ -277,6 +277,7 @@ gateway:
     level_default: "medium (default)"
     level_disabled: "none (disabled)"
     scope_session: "session override"
+    scope_topic: "topic config"
     scope_global: "global config"
     status: "🧠 **Reasoning Settings**\n\n**Effort:** `{level}`\n**Scope:** {scope}\n**Display:** {display}\n\n_Usage:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"
     display_on: "on ✓"
@@ -298,6 +299,7 @@ gateway:
     quote_label_md: "> 💭 **Reasoning:**"
     more_lines: "\n_... ({count} more lines)_"
     block: "💭 **Reasoning:**\n```\n{reasoning}\n```\n\n{response}"
+
   reload_mcp:
     cancelled: "🟡 /reload-mcp cancelled. MCP tools unchanged."
     always_followup: "ℹ️ Future `/reload-mcp` calls will run without confirmation. Re-enable via `approvals.mcp_reload_confirm: true` in config.yaml."
