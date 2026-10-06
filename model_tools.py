@@ -961,6 +961,11 @@ def handle_function_call(
         start = time.monotonic()
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
                                enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
+        try:
+            from tools.kanban_tools import record_worker_tool_result
+            record_worker_tool_result(function_name, result)
+        except Exception:
+            logger.debug("kanban worker evidence recording failed", exc_info=True)
         duration_ms = _elapsed_ms(start)
         _emit(result, duration_ms=duration_ms)
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)

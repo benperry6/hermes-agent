@@ -30,6 +30,27 @@ def _dict_args(raw: Any) -> dict:
     return args if isinstance(args, dict) else {"arguments": args}
 
 
+def _tool_payload_failed(value: Any) -> bool:
+    if isinstance(value, str):
+        try:
+            return _tool_payload_failed(json.loads(value))
+        except (TypeError, ValueError):
+            return value.strip().lower().startswith(("error", "failed:"))
+    if isinstance(value, list):
+        return any(_tool_payload_failed(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    return bool(
+        value.get("isError") is True or value.get("error")
+        or value.get("ok") is False or value.get("success") is False
+        or str(value.get("status") or "").lower() in {
+            "error", "failed", "failure", "cancelled", "canceled", "timeout",
+        }
+        or _tool_payload_failed(value.get("structuredContent"))
+        or _tool_payload_failed(value.get("content"))
+    )
+
+
 @dataclass
 class ProjectionResult:
     """Output of projecting one Codex item; empty ``messages`` = ignored (e.g. a streaming delta)."""
@@ -37,6 +58,7 @@ class ProjectionResult:
     messages: list[dict] = field(default_factory=list)
     is_tool_iteration: bool = False
     final_text: Optional[str] = None  # Set when an agentMessage completes
+    material_tool_name: Optional[str] = None
 
 
 class CodexEventProjector:
@@ -99,7 +121,20 @@ class CodexEventProjector:
             tool_calls=[{"id": call_id, "type": "function", "function": {"name": name, "arguments": _format_tool_args(args)}}],
         )
         tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
-        return ProjectionResult(messages=[assistant_msg, tool_msg], is_tool_iteration=True)
+        status = str(item.get("status") or "").lower()
+        material = None
+        if id_type == "exec" and status == "completed" and item.get("exitCode") == 0:
+            material = name
+        elif id_type == "apply_patch" and status in {"applied", "completed", "success"} and item.get("changes"):
+            material = name
+        elif id_type.startswith("mcp__") and status == "completed" and not item.get("error") and not _tool_payload_failed(item.get("result")):
+            material = name
+        elif id_type.startswith("dyn_") and status == "completed" and item.get("success") is True:
+            material = name
+        return ProjectionResult(
+            messages=[assistant_msg, tool_msg], is_tool_iteration=True,
+            material_tool_name=material,
+        )
 
     @staticmethod
     def _command_spec(item: dict) -> tuple[str, str, dict, str]:
