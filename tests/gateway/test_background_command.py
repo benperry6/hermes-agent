@@ -311,7 +311,10 @@ class TestRunBackgroundTask:
             mock_agent_instance.shutdown_memory_provider = MagicMock()
             mock_agent_instance.close = MagicMock()
             mock_agent_instance._session_db = MagicMock()
-            mock_agent_instance._session_db.get_messages_as_conversation.return_value = child_history
+            mock_agent_instance._session_db.get_messages_as_conversation.side_effect = [
+                [],
+                child_history,
+            ]
             mock_agent_instance.run_conversation.return_value = mock_result
             MockAgent.return_value = mock_agent_instance
 
@@ -378,11 +381,138 @@ class TestRunBackgroundTask:
         assert origin["user_initiated"] is True
         assert origin["command"] == "/bg"
         mock_agent_instance._session_db.append_messages_batch.assert_called_once_with(
-            "bg_test", parent_history, chunk_rows=500
+            "bg_test", parent_history
         )
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
+
+    @pytest.mark.asyncio
+    async def test_parent_tool_pair_survives_snapshot_reload_until_first_run(self, tmp_path):
+        from hermes_state import SessionDB
+
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        adapter.extract_media = MagicMock(return_value=([], "done"))
+        adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        db = SessionDB(db_path=tmp_path / "state.db")
+        runner._session_db = db
+        task_id = "bg_tool_pair"
+        db.create_session("parent-session", source="telegram")
+        db.create_session(task_id, source="telegram", parent_session_id="parent-session")
+        tool_calls = [
+            {
+                "id": "call_weather_1",
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "arguments": '{"query":"weather Paris"}',
+                },
+            }
+        ]
+        parent_history = [
+            {"role": "user", "content": "Quel temps fait-il à Paris ?"},
+            {"role": "assistant", "content": "", "tool_calls": tool_calls},
+            {
+                "role": "tool",
+                "tool_call_id": "call_weather_1",
+                "name": "web_search",
+                "content": '{"temperature_c":21}',
+            },
+            {"role": "assistant", "content": "Il fait 21 °C à Paris."},
+        ]
+        agent = MagicMock()
+        agent._session_db = db
+        agent.run_conversation.return_value = {
+            "final_response": "done",
+            "messages": [],
+        }
+
+        try:
+            with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+                 patch("gateway.run._load_gateway_config", return_value={}), \
+                 patch("run_agent.AIAgent", return_value=agent):
+                await runner._run_background_task(
+                    "Résume la réponse précédente.",
+                    _make_event().source,
+                    task_id,
+                    parent_session_id="parent-session",
+                    parent_session_key="telegram:67890",
+                    parent_conversation_history=parent_history,
+                )
+
+            reloaded = agent.run_conversation.call_args.kwargs["conversation_history"]
+            assert [message["role"] for message in reloaded] == [
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+            ]
+            assert reloaded[1]["tool_calls"] == tool_calls
+            assert reloaded[2]["tool_call_id"] == tool_calls[0]["id"]
+            assert reloaded[2]["content"] == '{"temperature_c":21}'
+            assert agent.run_conversation.call_args.kwargs["user_message"].endswith(
+                "Résume la réponse précédente."
+            )
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_parent_snapshot_persistence_is_idempotent_for_same_task_id(self, tmp_path):
+        from hermes_state import SessionDB
+
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        adapter.extract_media = MagicMock(return_value=([], "done"))
+        adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        db = SessionDB(db_path=tmp_path / "state.db")
+        runner._session_db = db
+        task_id = "bg_redelivery"
+        db.create_session("parent-session", source="telegram")
+        db.create_session(task_id, source="telegram", parent_session_id="parent-session")
+        parent_history = [
+            {"role": "user", "content": "Parent request"},
+            {"role": "assistant", "content": "Parent response"},
+        ]
+        agent = MagicMock()
+        agent._session_db = db
+        agent.run_conversation.return_value = {
+            "final_response": "done",
+            "messages": [],
+        }
+
+        try:
+            with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+                 patch("gateway.run._load_gateway_config", return_value={}), \
+                 patch("run_agent.AIAgent", return_value=agent):
+                for _ in range(2):
+                    await runner._run_background_task(
+                        "Do the detached work",
+                        _make_event().source,
+                        task_id,
+                        parent_session_id="parent-session",
+                        parent_session_key="telegram:67890",
+                        parent_conversation_history=parent_history,
+                    )
+
+            persisted = db.get_messages_as_conversation(task_id)
+            assert [message["content"] for message in persisted] == [
+                "Parent request",
+                "Parent response",
+            ]
+            assert len(agent.run_conversation.call_args_list) == 2
+            assert [
+                message["content"]
+                for message in agent.run_conversation.call_args_list[1].kwargs[
+                    "conversation_history"
+                ]
+            ] == ["Parent request", "Parent response"]
+        finally:
+            db.close()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -524,6 +654,7 @@ class TestRunBackgroundTask:
         mock_adapter.emit_warning.assert_awaited_once()
         assert mock_adapter.emit_warning.await_args.args[0] == source.chat_id
         assert "scheduled work" in mock_adapter.emit_warning.await_args.args[1]
+
 
 
 class TestAIAgentGatewayPeerContract:
@@ -804,3 +935,22 @@ async def test_background_preserves_delivery_for_narrow_agent_signature():
     adapter.send.assert_awaited_once()
     assert "narrow callable complete" in adapter.send.await_args.kwargs["content"]
     adapter.emit_warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_background_existing_child_progress_is_never_reseeded():
+    runner = _make_runner()
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    adapter.extract_media.return_value = ([], "done")
+    adapter.extract_images.return_value = ([], "done")
+    runner.adapters[Platform.TELEGRAM] = adapter
+    old_parent = [{"role":"user","content":"parent"},{"role":"assistant","content":"reply"}]
+    existing = old_parent + [{"role":"user","content":"child follow-up"},{"role":"assistant","content":"child progress"}]
+    with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key":"test-key"}), patch("gateway.run._load_gateway_config",return_value={}), patch("run_agent.AIAgent") as Factory:
+        agent = Factory.return_value
+        agent._session_db.get_messages_as_conversation.return_value = existing
+        agent.run_conversation.return_value = {"final_response":"done","messages":[]}
+        await runner._run_background_task("continue",_make_event().source,"bg_progress",parent_session_id="parent",parent_session_key="telegram:67890",parent_conversation_history=old_parent)
+    agent._session_db.append_messages_batch.assert_not_called()
+    assert agent.run_conversation.call_args.kwargs["conversation_history"] == existing

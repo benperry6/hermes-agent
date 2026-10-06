@@ -2595,16 +2595,19 @@ class GatewayTurnMixin:
                             raise RuntimeError(
                                 "Background child session DB unavailable for parent snapshot"
                             )
-                        if parent_conversation_history:
-                            agent._session_db.append_messages_batch(
-                                task_id,
-                                parent_conversation_history,
-                                chunk_rows=500,
-                            )
                         conversation_history = agent._session_db.get_messages_as_conversation(
                             task_id,
                             repair_alternation=True,
                         )
+                        if not conversation_history and parent_conversation_history:
+                            agent._session_db.append_messages_batch(
+                                task_id,
+                                parent_conversation_history,
+                            )
+                            conversation_history = agent._session_db.get_messages_as_conversation(
+                                task_id,
+                                repair_alternation=True,
+                            )
                         if parent_conversation_history and not conversation_history:
                             raise RuntimeError(
                                 "Background parent context snapshot was not persisted"
