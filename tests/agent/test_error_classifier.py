@@ -713,7 +713,7 @@ class TestClassifyApiError:
     def test_message_only_cyber_content_policy_blocked(self):
         # OpenAI Codex returns this without an HTTP status. Retrying the
         # same prompt three times only repeats the same policy decision, so
-        # the classifier must jump straight to fallback / abort instead of
+        # the classifier must abort without fallback instead of
         # leaving it in the retryable ``unknown`` bucket.
         e = Exception(
             "This content was flagged for possible cybersecurity risk. If this "
@@ -723,15 +723,15 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openai-codex", model="gpt-5.5")
         assert result.reason == FailoverReason.content_policy_blocked
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
         assert result.should_compress is False
 
     def test_400_content_exists_risk_commandcode_moderation(self):
         # CommandCode gateway (OpenAI-compatible aggregator fronting DeepSeek)
         # rejects filtered prompts with HTTP 400 "Content Exists Risk" and a
         # nested param envelope marking isRetryable=false — deterministic for
-        # the unchanged request, so the recovery is the fallback chain, not a
-        # same-provider retry. Without the pattern the 400 fell through to
+        # the unchanged request, so do not retry or route the same blocked request
+        # through a fallback. Without the pattern the 400 fell through to
         # format_error and the surfaced copy blamed a malformed request. See
         # #115218.
         body = {
@@ -755,7 +755,7 @@ class TestClassifyApiError:
         )
         assert result.reason == FailoverReason.content_policy_blocked
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
         assert result.should_compress is False
 
 

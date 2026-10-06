@@ -152,6 +152,29 @@ def _result_layer(reason: str, error_text: str, provider: str) -> str:
     return LAYER_STREAMING if _looks_like_stream_drop(error_text) else LAYER_PROVIDER
 
 
+def nonsecret_error_identifiers(source: Any) -> dict:
+    """Keep only explicit provider diagnostic identifiers, never bodies or headers wholesale."""
+    import re
+    from agent.redact import redact_sensitive_text
+
+    body = getattr(source, "body", None)
+    payload = body.get("error", body) if isinstance(body, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    headers = getattr(getattr(source, "response", None), "headers", None) or {}
+    values = {
+        "request_id": (getattr(source, "request_id", None) or getattr(source, "_request_id", None)
+                       or headers.get("x-request-id") or payload.get("request_id")),
+        "response_id": (getattr(source, "response_id", None) or getattr(source, "id", None)
+                        or payload.get("response_id")),
+        "code": payload.get("code"),
+    }
+    return {
+        key: value for key, value in values.items()
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", value)
+        and redact_sensitive_text(value, force=True) == value
+    }
+
+
 def build_error_surface_from_result(result: Any, provider: str = "", model: str = "") -> Optional[dict]:
     """Descriptor for a returned-error turn result (``failed=True`` dicts).
 
@@ -163,7 +186,7 @@ def build_error_surface_from_result(result: Any, provider: str = "", model: str 
             return None
         error_text = str(result.get("error") or "")
         reason = str(result.get("failure_reason") or "").strip()
-        if not error_text and not reason:
+        if not error_text and not reason and not result.get("failed"):
             return None
         # Disk-full wins outright: the fix (free space) is unrelated to the
         # provider stack; hermes_state owns the pattern list.

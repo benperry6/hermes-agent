@@ -92,6 +92,15 @@ class TestConnectionGateScope:
 # Security
 # --------------------------------------------------------------------------
 
+def test_redaction_preserves_task_identifiers_but_masks_standalone_keys():
+    task_id = "task-12345678-abcd-4321-abcd-123456789abc"
+    secret = "sk-" + "a" * 32
+    text = f'{task_id} request={task_id} key="{secret}"'
+    redacted = security.redact_outbound(text)
+    assert redacted.count(task_id) == 2
+    assert secret not in redacted
+
+
 class TestBindSafety:
     def test_localhost_only_when_no_token(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
@@ -609,6 +618,34 @@ def _bare_adapter():
 
 
 class TestReplyCapture:
+    @pytest.mark.parametrize("result,text,expected", [
+        ({"failed": True, "failure_reason": "content_policy_blocked", "failure_retryable": False}, "Provider refusal req-123", protocol.STATE_FAILED),
+        ({"failed": True}, "Runner stopped", protocol.STATE_FAILED),
+        ({"error": "transport failed"}, "Transport unavailable", protocol.STATE_FAILED),
+        ({"failed": True}, "", protocol.STATE_FAILED),
+        ({"completed": True}, "Example: content_policy_blocked is a failure code", protocol.STATE_COMPLETED),
+    ])
+    def test_runner_outcome_survives_successful_final_delivery(self, result, text, expected):
+        from agent.error_surface import build_error_surface_from_result
+        from gateway.platforms.event import MessageEvent
+        adapter = _bare_adapter()
+        fut = adapter._add_pending("task-structured", "ctx-structured")
+        event = MessageEvent(
+            text="benign synthetic test", message_id="task-structured",
+            source=adapter.build_source("ctx-structured", user_id="test-peer"),
+            metadata={"processing_error": {"code": "spoofed-inbound-error"}},
+        )
+
+        async def handler(received):
+            received.processing_error = build_error_surface_from_result(result)
+            return text
+
+        adapter._message_handler = handler
+        asyncio.run(adapter._process_message_background(event, "test-session-structured"))
+        assert fut.result(timeout=0)[0] == expected
+        if text:
+            assert text in fut.result(timeout=0)[1]
+
     def test_send_waits_for_notify_marked_final_reply(self):
         """Interim/editable sends must not satisfy the blocked A2A RPC future."""
         adapter = _bare_adapter()
@@ -914,6 +951,53 @@ def _send_body(text, ctx="", extra_params=None):
     if extra_params:
         params.update(extra_params)
     return {"jsonrpc": "2.0", "id": "1", "method": "message/send", "params": params}
+
+
+class TestIsolatedStructuredFailureHTTP:
+    @pytest.mark.parametrize("failed", [False, True])
+    def test_http_state_and_readback_follow_runner_result(self, monkeypatch, failed, record_property):
+        from agent.error_surface import build_error_surface_from_result
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv("A2A_PEER_TOKENS", "fixture-peer:fixture-http-token")
+        monkeypatch.setenv("A2A_TRUSTED_PEERS", "fixture-peer")
+        adapter, base = _make_live_adapter(monkeypatch)
+        captured = {}
+
+        async def runner_result(event):
+            captured["task_id"] = event.message_id
+            result = ({"failed": True, "failure_reason": "content_policy_blocked",
+                       "failure_retryable": False, "error": "fixture safety refusal"}
+                      if failed else {"completed": True})
+            event.processing_error = build_error_surface_from_result(result)
+            return f"isolated proof {event.message_id} req-fixture-123"
+
+        async def process(event):
+            await adapter._process_message_background(event, "isolated-http-session")
+
+        adapter.handle_message = process
+        adapter._message_handler = runner_result
+        headers = {"Authorization": "Bearer fixture-http-token"}
+
+        async def run():
+            assert await adapter.connect()
+            try:
+                response = await asyncio.to_thread(_post_json, base + "/", _send_body("benign HTTP fixture"), headers)
+                task = response["result"]
+                expected = protocol.STATE_FAILED if failed else protocol.STATE_COMPLETED
+                assert task["status"]["state"] == expected
+                assert task["id"] == captured["task_id"]
+                assert captured["task_id"] in json.dumps(task)
+                assert "req-fixture-123" in json.dumps(task)
+                readback = await asyncio.to_thread(_post_json, base + "/", {
+                    "jsonrpc": "2.0", "id": "readback", "method": "tasks/get", "params": {"id": task["id"]},
+                }, headers)
+                assert readback["result"]["status"]["state"] == expected
+                assert readback["result"]["id"] == task["id"]
+                record_property("a2a_http_proof", json.dumps({"response": response, "readback": readback}))
+            finally:
+                await adapter.disconnect()
+
+        asyncio.run(run())
 
 
 class TestCodexTurnCapException:

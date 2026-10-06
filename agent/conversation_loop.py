@@ -986,6 +986,12 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 )
 
 
+# Shared trailer for both content-policy refusal paths so guidance cannot drift.
+_CONTENT_POLICY_RECOVERY_HINT = (
+    "If this authorized request was blocked incorrectly, contact the provider through its "
+    "official review/support process with the non-secret request identifiers. "
+    "Do not switch provider, model, credentials, or session to bypass this refusal."
+)
 
 
 # Memo for send-path tool-call argument canonicalization (re-run on every historical call
@@ -1068,14 +1074,20 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
 
 
 def _content_policy_blocked_result(
-    messages: List[Dict], api_call_count: int, *, final_response: str, error_detail: str
+    messages: List[Dict], api_call_count: int, *, final_response: str, error_detail: str,
+    provider_response: Any = None,
 ) -> Dict[str, Any]:
     """Terminal turn result for a content-policy block (deterministic for the unchanged
     prompt, so no retry); shared by the HTTP-200 and exception paths."""
+    from agent.error_surface import nonsecret_error_identifiers
+    identifiers = nonsecret_error_identifiers(provider_response)
+    if identifiers:
+        final_response += "\n\nProvider identifiers: " + ", ".join(f"{k}={v}" for k, v in identifiers.items())
     return {
         "final_response": final_response, "messages": messages, "api_calls": api_call_count,
         "completed": False, "failed": True, "error": f"content_policy_blocked: {error_detail}",
         "failure_reason": "content_policy_blocked", "failure_retryable": False,
+        "failure_identifiers": identifiers,
     }
 
 

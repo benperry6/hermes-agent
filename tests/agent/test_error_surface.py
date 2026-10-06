@@ -20,6 +20,22 @@ from agent.error_surface import (
 # ── build_error_surface_from_result ──────────────────────────────────────
 
 
+def test_provider_identifiers_are_allowlisted_and_nonsecret():
+    from types import SimpleNamespace
+    from agent.error_surface import nonsecret_error_identifiers
+    source = SimpleNamespace(
+        body={"error": {"code": "safety_block", "response_id": "resp-xyz", "message": "private body"}},
+        response=SimpleNamespace(headers={"x-request-id": "req-abc", "Authorization": "private header"}),
+    )
+    assert nonsecret_error_identifiers(source) == {
+        "request_id": "req-abc", "response_id": "resp-xyz", "code": "safety_block",
+    }
+    source.request_id = "sk-" + "a" * 32
+    source.response_id = "untrusted\nmultiline"
+    assert nonsecret_error_identifiers(source) == {"code": "safety_block"}
+    assert nonsecret_error_identifiers(None) == {}
+
+
 def _failed_result(reason: str = "", error: str = "provider exploded", **extra) -> dict:
     result = {"completed": False, "failed": True, "error": error}
     if reason:

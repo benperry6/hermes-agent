@@ -2242,6 +2242,8 @@ class GatewayTurnMixin:
                 self._hmwa_discard_stale_result(source, _quick_key, run_generation)
                 return None
 
+            from agent.error_surface import build_error_surface_from_result
+            event.processing_error = build_error_surface_from_result(agent_result)
             response, _intentional_silence, agent_messages = await self._hmwa_shape_agent_response(
                 agent_result, source, history, session_entry, session_key,
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,

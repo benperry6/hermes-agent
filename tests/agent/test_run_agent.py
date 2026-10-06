@@ -3203,7 +3203,12 @@ class TestRunConversation:
             },
         ]
 
-    def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
+    @pytest.mark.parametrize("raised", [False, True])
+    @pytest.mark.parametrize("refusal_message", [
+        "This content was flagged for possible cybersecurity risk.",
+        "This request was blocked by our safety systems. Reason: Potentially unintended activity.",
+    ])
+    def test_codex_content_filter_stops_without_fallback(self, agent, raised, refusal_message):
         self._setup_agent(agent)
         agent.api_mode = "codex_responses"
         agent.provider = "openai-codex"
@@ -3237,6 +3242,9 @@ class TestRunConversation:
             model="fallback/model",
             usage=None,
         )
+        refusal_error = RuntimeError(refusal_message)
+        refusal_error.request_id = "req-nonsecret-123"
+        content_filter_response.id = "resp-nonsecret-456"
         hook_events = []
         logical_completions = []
 
@@ -3247,7 +3255,7 @@ class TestRunConversation:
         with (
             patch.object(agent, "_create_request_openai_client", return_value=MagicMock()),
             patch.object(agent, "_close_request_openai_client"),
-            patch.object(agent, "_run_codex_stream", side_effect=[content_filter_response, fallback_response]) as mock_run_codex_stream,
+            patch.object(agent, "_run_codex_stream", side_effect=[refusal_error if raised else content_filter_response, fallback_response]) as mock_run_codex_stream,
             patch.object(agent, "_try_activate_fallback", side_effect=_fake_activate) as mock_try_activate_fallback,
             patch.object(agent, "_invoke_api_request_error_hook", side_effect=lambda **kw: hook_events.append(kw)),
             patch(
@@ -3262,16 +3270,19 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("summarize this large Slack thread")
 
-        assert result["final_response"] == "Recovered on fallback"
-        assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with()
-        assert mock_run_codex_stream.call_count == 2
-        assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["failure_reason"] == "content_policy_blocked"
+        assert result["failure_retryable"] is False
+        expected_identifier = "req-nonsecret-123" if raised else "resp-nonsecret-456"
+        assert expected_identifier in result["final_response"]
+        assert expected_identifier in result["failure_identifiers"].values()
+        mock_try_activate_fallback.assert_not_called()
+        assert mock_run_codex_stream.call_count == 1
+        assert hook_events[0]["error_type"] == ("RuntimeError" if raised else "ContentPolicyBlocked")
         assert hook_events[0]["retryable"] is False
         assert hook_events[0]["reason"] == FailoverReason.content_policy_blocked.value
-        assert logical_completions == [
-            (hook_events[0]["api_request_id"], "success")
-        ]
+        assert not any(outcome == "success" for _, outcome in logical_completions)
 
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)
