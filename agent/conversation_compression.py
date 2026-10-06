@@ -1644,6 +1644,8 @@ def _adopt_live_compression_child(
     if not isinstance(child, dict) or child.get("ended_at") is not None:
         return None
     recovered = loader(session_db, child_session_id)
+    if isinstance(recovered, list):
+        recovered = _project_passive_gateway_receipts(recovered)
     if not (isinstance(recovered, list) and recovered):
         return None
     # Revalidate after loading: the tip may have rotated or a competing
@@ -2876,6 +2878,19 @@ def _adopt_if_parent_rotated(
     return messages, _existing_sp
 
 
+
+def _project_passive_gateway_receipts(messages: list) -> list:
+    """Compression can adopt DB rows without going through gateway replay filtering.
+
+    Only this gateway-owned event type needs projection; ordinary agent histories stay
+    untouched. Otherwise a no-progress compression returns session_meta to the provider.
+    """
+    if any(m.get("role") == "session_meta" and m.get("display_kind") == "background_context"
+           for m in messages):
+        from gateway.session_transcript import background_context_for_compaction
+        return background_context_for_compaction(messages, preserve_other_roles=True)
+    return messages
+
 def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: list) -> Optional[list]:
     """Return the durable parent transcript when it outgrew the in-memory snapshot.
     Rotation only (in-place never loses rows). The snapshot predates the lease: if durable grew, a writer
@@ -2924,7 +2939,7 @@ def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: 
         "compression: session=%s grew before lease (%d → %d msgs); adopting durable snapshot", lease.sid, len(messages),
         len(durable_parent),
     )
-    return durable_parent
+    return _project_passive_gateway_receipts(durable_parent)
 
 
 def _pre_compress_memory_context(agent: Any, messages: list, checkpoint_required: bool) -> str:

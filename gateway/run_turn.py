@@ -1363,7 +1363,8 @@ class GatewayTurnMixin:
             elif _hyg_runtime.get("api_key"):
                 # Pass the FULL transcript (tool results included) as the agent loop does: filtering
                 # to user/assistant starved the compressor (tool results are the bulk of context).
-                _hyg_msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
+                from gateway.session_transcript import background_context_for_compaction
+                _hyg_msgs = background_context_for_compaction(history)
                 if len(_hyg_msgs) >= 4:
                     await self._hmwa_hygiene_detached_attempt(
                         attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
@@ -2456,17 +2457,27 @@ class GatewayTurnMixin:
             _event_media_is_image, _load_gateway_config, _platform_config_key,
         )
         from run_agent import AIAgent
+        from gateway.session_transcript import background_context_receipt
+
+        async def record_result(text):
+            if parent_session_id:
+                await self.async_session_store.append_to_transcript(
+                    parent_session_id, background_context_receipt(task_id, "result", text))
+
+        task_finished = False
         media_urls = media_urls or []
         media_types = media_types or []
         adapter = self._delivery_adapter_for(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            await record_result(f"Task {task_id} failed: no platform adapter available.")
             return
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
         if bool(parent_session_id) != bool(parent_session_key) or (
             parent_session_id and parent_conversation_history is None
         ):
+            await record_result(f"Task {task_id} failed: required parent context snapshot is incomplete.")
             await adapter.send(
                 chat_id=source.chat_id,
                 content=(
@@ -2481,7 +2492,10 @@ class GatewayTurnMixin:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
             if not runtime_kwargs.get("api_key"):
+                await record_result(f"Task {task_id} failed: no provider credentials configured.")
+                task_finished = True
                 await adapter.send(source.chat_id, t("gateway.background.no_credentials"), metadata=_thread_metadata)
+
                 return
 
             platform_key = _platform_config_key(source.platform)
@@ -2637,8 +2651,17 @@ class GatewayTurnMixin:
             if response:
                 response = repair_explicit_computer_use_media_paths(response, result.get("messages", []))
 
+            failed = bool(result and result.get("error"))
+            await record_result(
+                f"Task {task_id} {'failed' if failed else 'completed'}.\n"
+                f"Request: {prompt}\nResult: {response or '(No response generated)'}")
+            task_finished = True
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-            header = t("gateway.background.complete_header", preview=preview)
+            header = (
+                f'❌ Background task failed\nPrompt: "{preview}"\n\n'
+                if failed else t("gateway.background.complete_header", preview=preview)
+            )
+
             images, media_files, text_content = [], [], ""
             if response:
                 media_files, response = adapter.extract_media(response)
@@ -2677,6 +2700,8 @@ class GatewayTurnMixin:
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
+            if not task_finished:
+                await record_result(f"Task {task_id} failed: {e}")
             # Automatic failure diagnostic (the task produced no requested result to deliver).
             with suppress(Exception):
                 await adapter.emit_warning(

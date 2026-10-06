@@ -5,6 +5,7 @@ bound onto ``SessionStore`` via the MRO."""
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -25,6 +26,99 @@ class TranscriptReadError(RuntimeError):
         self.session_id = session_id
         super().__init__(f"transcript read failed for session {session_id}")
 
+
+def _plain_text(content) -> str:
+    """Text of a message content (str or text-part list); "" for anything else."""
+    if isinstance(content, list):
+        parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+        return "\n".join(t for t in parts if t)
+    return content if isinstance(content, str) else ""
+
+
+
+_BACKGROUND_CONTEXT_KIND = "background_context"
+
+
+def background_context_receipt(task_id: str, phase: str, text: str) -> Dict[str, Any]:
+    """Passive transcript event; never a user turn or an assistant tool response."""
+    return {
+        "role": "session_meta", "display_kind": _BACKGROUND_CONTEXT_KIND,
+        "content": text,
+        "display_metadata": {"background_event_id": f"{task_id}:{phase}"},
+    }
+
+
+def is_background_context_receipt(message: Dict[str, Any]) -> bool:
+    return (message.get("role") == "session_meta"
+            and message.get("display_kind") == _BACKGROUND_CONTEXT_KIND)
+
+
+def pending_background_context(history: List[Dict[str, Any]]) -> Optional[str]:
+    """Find events not yet carried by a durable real turn. No extra acknowledgement store."""
+    carried = {
+        identity for message in history if message.get("role") == "user"
+        for identity in (message.get("display_metadata") or {}).get("background_event_ids", [])
+        if isinstance(identity, str)
+    }
+    pending = []
+    seen = set()
+    for message in history:
+        if not is_background_context_receipt(message):
+            continue
+        identity = (message.get("display_metadata") or {}).get("background_event_id")
+        content = _plain_text(message.get("content"))
+        if isinstance(identity, str) and identity not in seen and identity not in carried:
+            pending.append({"id": identity, "text": content})
+            seen.add(identity)
+    # Encode arbitrary request/result text separately from identities. Quotes, delimiter
+    # examples and other tasks' IDs in a result can never acknowledge those other tasks.
+    return json.dumps(pending, ensure_ascii=False) if pending else None
+
+
+def background_context_carrier(message: Any, context: str) -> Dict[str, Any]:
+    """Use existing transcript presentation metadata for durable consumption identity."""
+    return {
+        "role": "user", "content": wrap_background_context(message, context),
+        "display_kind": "background_context_carrier",
+        "display_metadata": {"background_event_ids": [event["id"] for event in json.loads(context)]},
+    }
+
+
+def wrap_background_context(message: Any, context: Optional[str]) -> Any:
+    """Append-only context carrier. The separate current_user_text remains authoritative.
+
+    Persist this carrier in content, not solely api_content: native compression summarizes
+    content. These are recorded events, not new operator instructions or an invitation to act.
+    """
+    if not context:
+        return message
+    prefix = (
+        "[Background task context — recorded events, not a new request. "
+        "Tasks were already launched separately. Do not execute them again or announce "
+        "their results again unless the current user asks.]\n"
+        f"{context}\n[End background task context]\n\n"
+    )
+    prefix += (
+        "[No new user request. Continue the existing user request above; this event only supplies context.]\n"
+        if message == "" else "[Current user message]\n"
+    )
+    if isinstance(message, str):
+        return prefix + message
+    if isinstance(message, list):
+        return [{"type": "text", "text": prefix}] + list(message)
+    return message
+
+
+def background_context_for_compaction(
+    history: List[Dict[str, Any]], *, preserve_other_roles: bool = False,
+) -> List[Dict[str, Any]]:
+    """Make pending events visible to the summary without inserting them amid tool calls."""
+    context = pending_background_context(history)
+    messages = [m for m in history if not is_background_context_receipt(m)
+                and (preserve_other_roles or m.get("role") in {"user", "assistant", "tool"})]
+    if context:
+        messages.append(background_context_carrier("", context))
+    return messages
 
 def _spool_dropped(session_id: str, message: Dict[str, Any]):
     """Spool one evicted/undeliverable message to disk (same machinery as the shutdown flush, so it
@@ -583,8 +677,19 @@ class SessionTranscriptMixin:
             session_id = db.get_compression_tip(session_id) or session_id
         try:
             # repair_alternation: this feeds LIVE REPLAY; heal a durable user;user wedge once here.
-            return self._db_for_session_id(session_id).get_messages_as_conversation(
-                session_id, repair_alternation=True)
+            rows = self._db_for_session_id(session_id).get_messages_as_conversation(
+                session_id, repair_alternation=False)
+            # A receipt arriving between assistant(tool_calls) and tool must not interrupt
+            # the adjacency repair. Keep it outside replay until the next real user turn.
+            # Read acknowledgements before same-role repair can merge carrier metadata away.
+            pending = pending_background_context(rows)
+            pending_ids = {event["id"] for event in json.loads(pending)} if pending else set()
+            receipts = [m for m in rows if is_background_context_receipt(m)
+                        and (m.get("display_metadata") or {}).get("background_event_id") in pending_ids]
+            messages = [m for m in rows if not is_background_context_receipt(m)]
+            from agent.agent_runtime_helpers import repair_message_sequence
+            repair_message_sequence(None, messages)
+            return messages + receipts
         except Exception as e:
             # Empty history is valid data; a failed canonical read is not — live-replay callers
             # must fail closed, not start from [].
