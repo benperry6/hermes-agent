@@ -21,9 +21,11 @@ from agent.message_sanitization import _sanitize_surrogates, coalesce_tool_call_
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
+    _FORK_EDGE_MARKERS, _LEGACY_BACKGROUND_ID_RE, _NON_CONTINUATION_CHILD_FILTER_SQL,
     _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
+
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
@@ -1464,7 +1466,7 @@ class SessionMessagesMixin:
         """Redirect a resume target to the descendant holding the messages: follow the compression chain to
         the live tip (lineage-aware, so delegate/branch children never hijack it), then walk
         ``parent_session_id`` forward to the DEEPEST node with messages (a continuation may hold newer
-        turns), skipping branch/delegate/reset/tool children. Unchanged when nothing has messages; depth cap 32.
+        turns), skipping branch/delegate/background/reset/tool children. Unchanged when nothing has messages; depth cap 32.
 
         Context compression ends the current session and forks a new child session (linked via
         ``parent_session_id``). The flush cursor is reset, so the child is where new messages actually land
@@ -1487,11 +1489,10 @@ class SessionMessagesMixin:
                         best = current
                     child_row = conn.execute(
                         "SELECT id FROM sessions AS child WHERE child.parent_session_id = ? "
-                        f"  AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL "
-                        f"  AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL "
-                        f"  AND {_sql_json_extract('child.model_config', '$._reset_from')} IS NULL "
+                        f" {_NON_CONTINUATION_CHILD_FILTER_SQL.format(alias='child.')} "
+                        f"  AND COALESCE({_sql_json_extract('child.model_config', '$._reset_from')}, '') "
+                        "      != child.parent_session_id "
                         f"  AND NOT {_legacy_reset_child_sql('child', _RESET_END_REASONS_SQL)} "
-                        "  AND COALESCE(child.source, '') != 'tool' "
                         "ORDER BY child.started_at DESC, child.id DESC LIMIT 1", (current,)).fetchone()
                 except Exception:
                     return session_id
@@ -1898,11 +1899,14 @@ class SessionMessagesMixin:
             (session_id, platform_message_id)) is not None
 
     def _is_explicit_fork_child_row(self, session: Dict[str, Any], *, include_reset: bool = False) -> bool:
-        """True when *session* is a branch, delegate, or tool child of its parent (``include_reset``: also a
+        """True when *session* is a branch, delegate, background, or tool child of its parent (``include_reset``: also a
         reset fork). Markers only count when they point at ``parent_session_id``: compression copies
         ``model_config`` onto the continuation, so presence-only matching would misclassify it (same binding
         as ``_NON_CONTINUATION_CHILD_FILTER_SQL``)."""
         if session.get("source") == "tool":
+            return True
+        parent_id = session.get("parent_session_id")
+        if parent_id and _LEGACY_BACKGROUND_ID_RE.fullmatch(str(session.get("id") or "")):
             return True
         cfg = session.get("model_config")
         if isinstance(cfg, str):
@@ -1912,7 +1916,7 @@ class SessionMessagesMixin:
                 return False
         if not isinstance(cfg, dict):
             return False
-        markers = (cfg.get("_branched_from"), cfg.get("_delegate_from"))
+        markers = tuple(cfg.get(marker) for marker in _FORK_EDGE_MARKERS)
         if include_reset:
             markers += (cfg.get("_reset_from"),)
         parent_id = session.get("parent_session_id")

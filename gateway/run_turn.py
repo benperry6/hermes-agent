@@ -1727,7 +1727,16 @@ class GatewayTurnMixin:
         # user turn so the conversation is preserved. (#7100)
         agent_failed_early = bool(agent_result.get("failed"))
         hidden_reasoning_incomplete = _is_gateway_hidden_reasoning_incomplete_turn(agent_result)
-        is_context_overflow_failure = is_context_overflow_failure_result(agent_result, len(history))
+        recoverable_preflight_timeout = (
+            agent_result.get("turn_exit_reason") == "context_compression_timeout"
+            and agent_result.get("api_calls") == 0
+            and agent_result.get("agent_persisted") is False
+            and not agent_result.get("compression_exhausted")
+        )
+        is_context_overflow_failure = (
+            not recoverable_preflight_timeout
+            and is_context_overflow_failure_result(agent_result, len(history))
+        )
         if is_context_overflow_failure:
             logger.info(
                 "Skipping transcript persistence for context-overflow "
@@ -1850,12 +1859,30 @@ class GatewayTurnMixin:
                 # Transient failure / hidden-reasoning incomplete: persist the user message without
                 # the provider error text (a gateway hint, not model output). Dedupe on platform
                 # message_id (Telegram retries after transient failures).
-                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
+                timeout_recovery = (
+                    agent_result.get("turn_exit_reason") == "context_compression_timeout"
+                    and agent_result.get("api_calls") == 0
+                    and agent_result.get("agent_persisted") is False
+                    and not agent_result.get("compression_exhausted")
+                )
+                owned_timeout = timeout_recovery and bool(prepared.persistence_owner) and await store.has_input_owner(
+                    sid, prepared.persistence_owner,
+                )
+                if owned_timeout or (event.message_id and await store.has_platform_message_id(sid, str(event.message_id))):
                     logger.info(
                         "Skipping duplicate user turn (message_id=%s) in session %s",
                         event.message_id, sid,
                     )
                 else:
+                    if timeout_recovery:
+                        metadata = _user_row.setdefault("display_metadata", {})
+                        metadata["turn_exit_reason"] = "context_compression_timeout"
+                        # The event supports quotes; only display_metadata survives
+                        # the native transcript write. No raw event/blob persistence.
+                        for key in ("reply_to_message_id", "reply_to_text"):
+                            value = getattr(event, key, None)
+                            if value is not None:
+                                metadata[key] = str(value)
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
@@ -2606,6 +2633,9 @@ class GatewayTurnMixin:
                 try:
                     conversation_history = None
                     if parent_session_id and parent_session_key:
+                        # Separate user job, not a continuation or a delegated subagent.
+                        # Stamp before record_gateway_session_peer lazily creates the row.
+                        agent._session_init_model_config["_background_from"] = parent_session_id
                         agent.record_gateway_session_peer(origin=origin, routable=False)
                         if agent._session_db is None:
                             raise RuntimeError(

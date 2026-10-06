@@ -1,14 +1,10 @@
 """Host compression timeout terminates the turn before provider re-entry (#98722).
 
-Salvaged from #98741 and composed with the already-merged #98424 turn-start
-fail-closed boundary:
-
-- #98424 covers the TURN-START preflight (raises
-  ``PreflightCompressionTimedOut`` before the loop starts).
-- These tests pin the two consumers unique to #98741: the provider-overflow
-  recovery path must not re-enter compression / re-send the unchanged request
-  once the wait budget was spent, and the mid-turn pre-API pass must end the
-  turn with the typed ``compression_exhausted`` recovery contract.
+The provider-overflow recovery path must not re-enter compression or resend an
+unchanged request after the wait budget expires. At turn start, the provider has
+not been called and the agent has not persisted input: return a recoverable,
+non-exhausted result so the gateway can retain the user's request in its parent.
+These are distinct contracts; both terminate the current turn.
 """
 
 from __future__ import annotations
@@ -114,8 +110,8 @@ def test_overflow_recovery_timeout_ends_turn_without_provider_reentry():
     assert result["compression_exhausted"] is True
 
 
-def test_pre_api_compression_timeout_is_typed_terminal():
-    """Mid-turn pre-API pass that hits the host timeout ends the turn."""
+def test_turn_start_compression_timeout_is_recoverable_without_provider_send():
+    """A preflight timeout ends this turn without declaring session exhaustion."""
     agent = _make_agent()
     agent.context_compressor.protect_first_n = 0
     agent.context_compressor.protect_last_n = 0
@@ -148,30 +144,23 @@ def test_pre_api_compression_timeout_is_typed_terminal():
 
     agent._compress_context = _timed_out
 
-    from agent.turn_context import PreflightCompressionTimedOut
-
     history = [
         {"role": "user", "content": "old request"},
         {"role": "assistant", "content": "old response"},
     ]
     with (
-        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_persist_session") as persist,
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        # The turn-start boundary (#98424) may fire first and raise; both
-        # outcomes satisfy the invariant under test: the unchanged oversized
-        # request never reaches the provider after a host timeout.
-        try:
-            result = agent.run_conversation(
-                "continue", conversation_history=history
-            )
-        except PreflightCompressionTimedOut:
-            result = None
+        result = agent.run_conversation("continue", conversation_history=history)
 
     assert compression_calls == [1]
     agent.client.chat.completions.create.assert_not_called()
-    if result is not None:
-        assert result["failed"] is True
-        assert result["compression_exhausted"] is True
-        assert result["turn_exit_reason"] == "context_compression_timeout"
+    persist.assert_not_called()
+    assert result["failed"] is True
+    assert result["compression_exhausted"] is False
+    assert result["agent_persisted"] is False
+    assert result["api_calls"] == 0
+    assert result["turn_exit_reason"] == "context_compression_timeout"
+    assert result["messages"] == history
