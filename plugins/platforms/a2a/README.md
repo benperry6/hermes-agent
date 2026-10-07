@@ -65,6 +65,13 @@ existing synchronous wait limit is unchanged. A failed dispatch is now reported
 immediately on both paths, instead of waiting for that synchronous limit.
 Outbound Hermes tools are unchanged.
 
+Final deliveries must name their task: the native normal final supplies
+`_processing_message_id`; native inline/queued replies supply the explicit
+`reply_to` event ID. Neither may fall back to the oldest task in a context.
+Unbound notify sends (including unrelated cron notifications) fail visibly and
+leave the task/result untouched; progress sends cannot settle a task. Late or
+unknown bound IDs never consume another pending reply.
+
 Served sibling profiles remain native blocking forwards with their original
 execution timeout; the flag does **not** make those forwards immediate. There
 is no new worker reasoning deadline. Cancel changes protocol state, not worker

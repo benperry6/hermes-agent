@@ -512,10 +512,6 @@ class A2AAdapter(BasePlatformAdapter):
         with self._pending_lock:
             return self._resolve_locked(task_id, state, text)
 
-    def _resolve_oldest_for_context(self, context_id: str, state: str, text: str) -> bool:
-        with self._pending_lock:
-            return any(self._resolve_locked(tid, state, text) for tid in self._pending_order.get(context_id, ()))
-
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         return tuple(str((agent or self._agents[""]).get(k) or "") for k in ("slug", "tenant"))
 
@@ -898,20 +894,21 @@ class A2AAdapter(BasePlatformAdapter):
         logger.debug("A2A: push notification sent for task %s", task_id)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
-        """Fulfil the oldest pending reply Future for this context (``chat_id`` = A2A context id).
-        Only sends carrying ``metadata['notify']`` (the base adapter's final-reply marker) satisfy
-        the caller; progress/status/preview sends must not."""
+        """Settle only an explicitly bound final reply, never a context's oldest task.
+
+        The native normal final carries ``_processing_message_id``; inline/queued
+        replies carry their event's explicit ``reply_to`` instead. Unbound
+        notifications must fail visibly without consuming any task reply.
+        """
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
         else:
+            task_id = (metadata or {}).get("_processing_message_id", reply_to)
+            if not task_id:
+                return SendResult(success=False, error="A2A final requires _processing_message_id or an explicit reply_to task ID")
             state = protocol.STATE_FAILED if (metadata or {}).get("processing_error") is not None else protocol.STATE_COMPLETED
-            # The final reply's runner-owned outcome, not error-looking prose, is authoritative.
-            task_id = (metadata or {}).get("_processing_message_id")
-            if task_id:
-                # A bound late/duplicate reply must never fall through to another task.
-                resolved = self._resolve_task(str(task_id), state, content or "")
-            else:
-                resolved = self._resolve_oldest_for_context(chat_id, state, content or "")
+            # An unknown/late bound id must never fall through to another task.
+            resolved = self._resolve_task(str(task_id), state, content or "")
             if not resolved:
                 logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
