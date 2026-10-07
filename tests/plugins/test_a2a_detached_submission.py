@@ -279,3 +279,123 @@ def test_detached_failure_and_existing_blocking_paths(service, monkeypatch, case
         adapter._pending[result["id"]][1].set_exception(RuntimeError("inert future failure"))
         assert finish(result["id"])["status"]["state"] == protocol.STATE_FAILED
         assert result["id"] not in adapter._active_tasks
+
+
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_unbound_native_notification_cannot_finish_http_task(service, detached, failed):
+    """Real HTTP/base delivery; only inference is inert. No cron is scheduled."""
+    from concurrent.futures import ThreadPoolExecutor
+    from gateway.delivery import DeliveryRouter, DeliveryTarget
+    from gateway.config import GatewayConfig
+    from agent.error_surface import build_error_surface_from_result
+
+    adapter, loop, release, entered, calls, request, finish = service
+    params = {"message": {"role": "user", "parts": [{"kind": "text", "text": "inert correlation probe"}],
+                          "contextId": protocol.new_context_id()},
+              "configuration": {"returnImmediately": detached}}
+    nonce = "principal-" + protocol.new_context_id()
+    async def held(event):
+        calls.append(event)
+        entered.set()
+        while not release.is_set():
+            await asyncio.sleep(0.005)
+        if failed:
+            event.processing_error = build_error_surface_from_result({
+                "final_response": nonce, "failed": True,
+                "error": "inert correlation failure", "error_type": "provider_error"})
+        return nonce
+    adapter.set_message_handler(held)
+    cfg = GatewayConfig(platforms={adapter.platform: PlatformConfig(enabled=True)})
+    router = DeliveryRouter(cfg, {adapter.platform: adapter})
+    ctx = params["message"]["contextId"]
+    target = DeliveryTarget(platform=adapter.platform, chat_id=ctx, is_explicit=True)
+    def notify(metadata):
+        return asyncio.run_coroutine_threadsafe(
+            router._deliver_to_platform(target, "unrelated-" + nonce, metadata),
+            adapter._loop).result(timeout=2)
+    with ThreadPoolExecutor(max_workers=1) as clients:
+        original = clients.submit(request, "message/send", params)
+        try:
+            assert entered.wait(1)
+            task_id = calls[0].message_id
+            # Native handler may enter before the HTTP preparer marks WORKING.
+            admitted_state = None
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                admitted_state = request("tasks/get", {"id": task_id})["result"]["status"]["state"]
+                if admitted_state == protocol.STATE_WORKING:
+                    break
+                time.sleep(0.005)
+            assert admitted_state == protocol.STATE_WORKING
+            reply_waiter = adapter._pending[task_id][1]
+            # Exact cron live-lane metadata shape: job_id+notify, no task binding.
+            error = None
+            try:
+                notify({"job_id": "inert-notification", "notify": True})
+            except RuntimeError as exc:
+                error = str(exc)
+            assert not reply_waiter.done(), "notification settled the principal reply"
+            assert error and "_processing_message_id" in error
+            assert not (not detached and original.done())
+            for _ in range(2):
+                assert request("tasks/get", {"id": task_id})["result"]["status"]["state"] == protocol.STATE_WORKING
+            # A nonempty but unrelated id must not fall back to this context.
+            notify({"notify": True, "_processing_message_id": "unrelated-event"})
+            assert not reply_waiter.done()
+            release.set()
+            ack = original.result(timeout=2)["result"]
+            assert ack["id"] == task_id
+            result = finish(task_id)
+            expected = protocol.STATE_FAILED if failed else protocol.STATE_COMPLETED
+            assert result["status"]["state"] == expected
+            assert nonce in str(result) and "unrelated-" + nonce not in str(result)
+            assert len(calls) == 1
+            with pytest.raises(RuntimeError, match="_processing_message_id"):
+                notify({"job_id": "late-inert-notification", "notify": True})
+            notify({"notify": True, "_processing_message_id": task_id})
+            for _ in range(3):
+                got = request("tasks/get", {"id": task_id})["result"]
+                assert (got["id"], got["contextId"], got["status"]["state"]) == (task_id, ctx, expected)
+                # GET creates fresh envelope ids/timestamps; persisted reply parts stay exact.
+                assert got["status"]["message"]["parts"] == result["status"]["message"]["parts"]
+                assert [a["parts"] for a in got.get("artifacts", [])] == [a["parts"] for a in result.get("artifacts", [])]
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_native_queued_final_keeps_explicit_task_identity(reverse):
+    """Exercise the native queued ledger/retry lane, not a direct adapter send."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.platforms.base import _reply_anchor_for_event
+    from tests.gateway.test_max_concurrent_sessions import _make_runner
+    from tests.plugins.test_a2a_plugin import _bare_adapter
+
+    async def run():
+        adapter = _bare_adapter()
+        runner = _make_runner()
+        context = protocol.new_context_id()
+        source = adapter.build_source(
+            chat_id=context, chat_name=context, chat_type="dm",
+            user_id="inert-queued-peer", user_name="inert-queued-peer")
+        ids = [protocol.new_task_id(), protocol.new_task_id()]
+        futures = {task_id: adapter._add_pending(task_id, context) for task_id in ids}
+        order = list(reversed(ids)) if reverse else ids
+        for task_id in order:
+            event = MessageEvent(text="inert queued request", source=source, message_id=task_id)
+            metadata = runner._thread_metadata_for_source(source, _reply_anchor_for_event(event))
+            assert not (metadata or {}).get("_processing_message_id")
+            text = "queued final " + task_id
+            result = await runner._send_queued_final_text(
+                adapter, source, text, metadata, _reply_anchor_for_event(event),
+                "inert-queued-session", inbound_message_id=task_id)
+            assert result.success
+            assert futures[task_id].done()
+            assert futures[task_id].result()[1] == text
+            for untouched in ids:
+                if untouched not in order[:order.index(task_id) + 1]:
+                    assert not futures[untouched].done()
+        assert all(future.done() for future in futures.values())
+
+    asyncio.run(run())
