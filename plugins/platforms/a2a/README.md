@@ -53,6 +53,55 @@ and push notification configs (inline or via
 memory — and the reply is returned over A2A. Completed tasks stay queryable
 via `tasks/get`.
 
+## Detached submission — local customization, not activated yet
+
+The server delta derived from PR #103453 (head
+`e2725376d4a061b0d75a1328a33ebdd230f32332`) accepts the literal JSON boolean
+`params.configuration.returnImmediately: true` on the root/default local route.
+It returns the existing task handle without holding the HTTP connection. Submit
+once, retain task ID and context ID, then call `tasks/get` with that task ID;
+closing the client does not cancel the native runner. Without the flag, the
+existing synchronous wait limit is unchanged. A failed dispatch is now reported
+immediately on both paths, instead of waiting for that synchronous limit.
+Outbound Hermes tools are unchanged.
+
+Served sibling profiles remain native blocking forwards with their original
+execution timeout; the flag does **not** make those forwards immediate. There
+is no new worker reasoning deadline. Cancel changes protocol state, not worker
+lifetime; one native finalization/audit outcome can still follow Cancel.
+
+Task handles remain in RAM: completed and published clarification replies share
+an existing budget of 500 records, with no restart or eviction durability.
+Published `INPUT_REQUIRED` is not an irreversible terminal state, remains
+cancelable and no longer expires merely because reasoning started over one hour
+ago. Eviction removes its stored watchers; native subscriptions retain their
+existing bounded wait, not a new immediate-close promise. Get never submits a
+turn. A later message in the same context creates a NEW task ID; no user-facing
+same-task-ID execution resume is promised. Get regenerates display IDs and
+timestamps: compare task ID, context ID, state and text, not full JSON equality.
+
+Use one detached mission in flight per context. Native handler/routing admission
+rejections settle honestly on the detached path; synchronous native queue remains
+unchanged. After protocol Cancel, a still-live native session owner blocks a new
+detached submit. A done owner with a retained guard is different: the adapter
+uses the native stale-owner predicate and lets `handle_message` perform its
+existing self-heal. A guard with no recorded owner is not stale and stays rejected.
+This guard never certifies physical worker/thread/process or
+publication exit. Long-lived WORKING is not proof of progress or permission to
+resend. Forwarded profiles remain synchronous.
+
+**Activation HOLD:** this is prepared source, not an installed or active port.
+Native count/publication gaps also pre-exist in the synchronous path. No core
+counter, registry, timer or restart is added. For THIS external activation,
+require actual no-push URL with quiescence and no callback already running, old
+administrative sync response fully returned, all public List pages without
+mutations on every enabled A2A listener (or proof that only one is enabled), and
+existing external drain/agent/process/worker/writer barriers.
+Cancel terminal or active_agents=0 alone are insufficient. Preserve old
+checkout/venv and rollback; never restart from the gateway cgroup. The Mac owner
+alone proves the real detached roundtrip after activation. A lost submit
+acknowledgment is uncertain remote state, never permission to blindly resend.
+
 ## Security
 
 - **No token ⇒ localhost only.** The server binds `127.0.0.1` and refuses to
