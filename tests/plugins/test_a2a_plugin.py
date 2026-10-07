@@ -635,7 +635,7 @@ class TestReplyCapture:
             final = await adapter.send(
                 "ctx-final",
                 "FINAL_PROOF_PAYLOAD",
-                metadata={"notify": True},
+                metadata={"notify": True, "_processing_message_id": "task-final"},
             )
             assert final.success is True
             assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "FINAL_PROOF_PAYLOAD")
@@ -645,20 +645,27 @@ class TestReplyCapture:
         finally:
             adapter._pop_pending("task-final")
 
-    def test_concurrent_same_context_tasks_resolve_fifo(self):
-        """Two in-flight tasks sharing a context must not cross-talk: replies
-        resolve the oldest outstanding task first."""
+    def test_same_context_native_inline_replies_keep_explicit_identity(self):
+        """Native inline finals carry reply_to; reversed order must not cross-talk."""
+        from gateway.platforms.event import MessageEvent
         adapter = _bare_adapter()
         fut1 = adapter._add_pending("task-1", "ctx-shared")
         fut2 = adapter._add_pending("task-2", "ctx-shared")
-
+        assert fut1 is not None and fut2 is not None
+        source = adapter.build_source(chat_id="ctx-shared", chat_type="dm", user_id="fixture-peer")
+        async def handler(event):
+            return "reply " + event.message_id
+        adapter.set_message_handler(handler)
         async def run():
-            await adapter.send("ctx-shared", "reply one", metadata={"notify": True})
-            assert fut1.done() and not fut2.done()
-            assert fut1.result(timeout=0)[1] == "reply one"
-            await adapter.send("ctx-shared", "reply two", metadata={"notify": True})
-            assert fut2.result(timeout=0)[1] == "reply two"
-
+            await adapter._dispatch_inline_reply(MessageEvent(text="inert", source=source, message_id="task-2"))
+            assert fut2.done() and not fut1.done()
+            assert fut2.result(timeout=0)[1] == "reply task-2"
+            # A bound duplicate id must not fall back even to an explicit other anchor.
+            await adapter.send("ctx-shared", "late", reply_to="task-1", metadata={
+                "notify": True, "_processing_message_id": "task-2"})
+            assert not fut1.done()
+            await adapter._dispatch_inline_reply(MessageEvent(text="inert", source=source, message_id="task-1"))
+            assert fut1.result(timeout=0)[1] == "reply task-1"
         try:
             asyncio.run(run())
         finally:
@@ -691,7 +698,7 @@ class TestReplyCapture:
         event = SimpleNamespace(message_id="task-ok")
 
         async def run():
-            await adapter.send("ctx-ok", "real reply", metadata={"notify": True})
+            await adapter.send("ctx-ok", "real reply", metadata={"notify": True, "_processing_message_id": event.message_id})
             await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
         try:
@@ -952,7 +959,7 @@ def _make_live_adapter(monkeypatch, reply_fn=None):
         else:
             reply = reply_fn(event)
         if reply is not None:
-            await adapter.send(event.source.chat_id, reply, metadata={"notify": True})
+            await adapter.send(event.source.chat_id, reply, metadata={"notify": True, "_processing_message_id": event.message_id})
 
     adapter.handle_message = fake_handle_message  # type: ignore
     adapter._message_handler = object()  # non-None so dispatch proceeds

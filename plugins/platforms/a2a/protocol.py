@@ -367,11 +367,19 @@ class TaskStore:
         with self._lock:
             return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant)) else None
 
-    def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
+    def complete(self, task_id: str, state: str, reply: str = "", *,
+                 _orphan_timeout: float | None = None) -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
         with self._lock:
             rec = self._tasks.get(task_id)
             if not rec or rec["state"] in TERMINAL_STATES:
+                return None
+            if _orphan_timeout is not None and (
+                rec.get("completed_at") is not None
+                or time.time() - rec["created_at"] <= _orphan_timeout
+            ):
+                # Sweep selection may race with publication. Recheck under the
+                # transition lock so a just-published clarification cannot vanish.
                 return None
             rec.update(state=state, reply=reply, completed_at=time.time())
             watchers = self._watchers.pop(task_id, [])
@@ -412,13 +420,20 @@ class TaskStore:
         with self._lock:
             stale = [tid for tid, rec in self._tasks.items()
                      if tid not in excluded and rec["state"] not in TERMINAL_STATES
+                     and rec.get("completed_at") is None
                      and time.time() - rec["created_at"] > timeout_seconds]
-        return [tid for tid in stale if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]")]
+        return [tid for tid in stale if self.complete(tid, STATE_FAILED,
+                    "[task orphaned — no reply produced]", _orphan_timeout=timeout_seconds)]
 
     def _trim_locked(self) -> None:
-        terminal = [tid for tid, rec in self._tasks.items() if rec["state"] in TERMINAL_STATES]
+        # Produced INPUT_REQUIRED replies share the existing RAM budget, but
+        # remain nonterminal and cancelable. No new store or permanent handle.
+        terminal = [tid for tid, rec in self._tasks.items()
+                    if rec["state"] in TERMINAL_STATES or (
+                        rec["state"] == STATE_INPUT_REQUIRED and rec.get("completed_at") is not None)]
         for tid in terminal[:max(0, len(terminal) - self._MAX_TERMINAL)]:
             self._tasks.pop(tid, None)
+            self._watchers.pop(tid, None)
 
     @staticmethod
     def to_task(rec: dict, include_artifacts: bool = True) -> dict:

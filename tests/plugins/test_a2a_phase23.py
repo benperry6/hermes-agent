@@ -47,7 +47,7 @@ def _make_live_adapter(monkeypatch, reply_fn=None):
     async def fake_handle_message(event):
         reply = "ECHO: " + event.text if reply_fn is None else reply_fn(event)
         if reply is not None:
-            await adapter.send(event.source.chat_id, reply, metadata={"notify": True})
+            await adapter.send(event.source.chat_id, reply, metadata={"notify": True, "_processing_message_id": event.message_id})
 
     adapter.handle_message = fake_handle_message  # type: ignore
     adapter._message_handler = object()
