@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -281,6 +282,7 @@ class A2AAdapter(BasePlatformAdapter):
         # the profile scope contextvar (same class as A2A_PORT above).
         self._public_url = _get_scoped_secret("A2A_PUBLIC_URL", "").strip()
         self._agents = self._load_served_agents(extra)
+        self._request_context = contextvars.copy_context()  # owning constructor profile
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._server_thread = self._watchdog_thread = None  # type: Optional[threading.Thread]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -479,9 +481,11 @@ class A2AAdapter(BasePlatformAdapter):
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
         return protocol.skills_from_toolsets(configured or [])
 
-    def _add_pending(self, task_id: str, context_id: str) -> Future:
+    def _add_pending(self, task_id: str, context_id: str, *, exclusive: bool = False) -> Optional[Future]:
         fut: Future = Future()
         with self._pending_lock:
+            if exclusive and self._pending_order.get(context_id):
+                return None  # Native merging cannot guarantee distinct task ownership.
             self._active_tasks.add(task_id)
             self._pending[task_id] = (context_id, fut)
             self._pending_order.setdefault(context_id, deque()).append(task_id)
@@ -511,10 +515,6 @@ class A2AAdapter(BasePlatformAdapter):
     def _resolve_task(self, task_id: str, state: str, text: str) -> bool:
         with self._pending_lock:
             return self._resolve_locked(task_id, state, text)
-
-    def _resolve_oldest_for_context(self, context_id: str, state: str, text: str) -> bool:
-        with self._pending_lock:
-            return any(self._resolve_locked(tid, state, text) for tid in self._pending_order.get(context_id, ()))
 
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         return tuple(str((agent or self._agents[""]).get(k) or "") for k in ("slug", "tenant"))
@@ -562,11 +562,41 @@ class A2AAdapter(BasePlatformAdapter):
                 self._pop_pending(task_id)
         if self._loop is None or self._message_handler is None:
             return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
-        fut = self._add_pending(task_id, context_id)
+        configuration = params.get("configuration")
+        immediate = isinstance(configuration, dict) and configuration.get("returnImmediately") is True
+        fut = (self._add_pending(task_id, context_id, exclusive=True) if immediate
+               else self._add_pending(task_id, context_id))
+        if fut is None:
+            message = "A task is already in flight for this context; retrieve its existing ID before submitting another."
+            return self._end_task(rec, protocol.STATE_REJECTED, message, stored_reply=message)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
                              source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+        def dispatch_done(dispatch: Future) -> None:
+            # Fail only an actual admission exception/cancellation. Queued native
+            # admission can finish before its turn, so success is NOT completion.
+            failure = "cancelled" if dispatch.cancelled() else dispatch.exception()
+            if failure is not None:
+                self._resolve_task(task_id, protocol.STATE_FAILED,
+                                   security.redact_outbound(f"Dispatch failed: {failure}"))
+
+        async def admit() -> None:
+            # Protocol cancel settles the reply, not the native worker. Only
+            # refuse a live native owner; let handle_message heal a done owner.
+            if immediate:
+                session_key = self._event_session_key(event)
+                if (session_key in self._active_sessions
+                        and not self._session_task_is_stale(session_key)):
+                    self._resolve_task(task_id, protocol.STATE_REJECTED,
+                        "This context still has native work in flight; cancel does not stop its worker.")
+                    return
+            await self.handle_message(event)
+            if immediate and getattr(event, "_gateway_accepted", False) is not True:
+                self._resolve_task(task_id, protocol.STATE_REJECTED,
+                                   "Gateway did not accept this task (handler, routing or admission rejection).")
+
         try:
-            asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
+            dispatch = asyncio.run_coroutine_threadsafe(admit(), self._loop)
+            dispatch.add_done_callback(dispatch_done)
         except Exception as e:
             msg = security.redact_outbound(f"Dispatch failed: {e}")
             try:
@@ -665,11 +695,48 @@ class A2AAdapter(BasePlatformAdapter):
         return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
 
+    def _finalize_task_in_background(self, pending: dict) -> Optional[dict]:
+        """PR103453: detach reply ownership, not the native runner's lifetime.
+
+        No HTTP deadline is imposed on reasoning. Keep ownership through outcome
+        publication so the orphan watchdog cannot mistake valid work for an orphan.
+        """
+        def wait_and_finalize() -> None:
+            try:
+                self._finalize_task(pending, *pending["future"].result())
+            except Exception as exc:
+                logger.exception("A2A: async finalizer failed for %s", pending["task_id"])
+                self.tasks.complete(pending["task_id"], protocol.STATE_FAILED,
+                                    security.redact_outbound(f"Task finalization failed: {exc}"))
+                self._pop_pending(pending["task_id"])
+
+        try:
+            from agent.memory_provider import spawn_context_thread
+            spawn_context_thread(wait_and_finalize,
+                                 name=f"a2a-finalize-{pending['task_id']}").start()
+        except Exception as exc:
+            state, reply = self._finalize_task(pending, protocol.STATE_FAILED,
+                                             security.redact_outbound(f"Task finalization failed: {exc}"))
+            return protocol.build_task(pending["task_id"], pending["context_id"], state, reply,
+                                       created_at=pending["created_iso"])
+        return None
+
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
+        # HTTP threads start unbound; finalizer/persistence inherit the adapter's
+        # owning scope, not whichever profile the gateway happens to serve next.
+        return self._request_context.copy().run(self._send_message, req_id, params, peer, agent, v1_response)
+
+    def _send_message(self, req_id: Any, params: dict, peer: str, agent: Optional[dict], v1_response: bool) -> dict:
         task, pending = self._prepare_task(params, peer, agent=agent)
         if task is None:
-            state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
+            configuration = params.get("configuration")
+            if isinstance(configuration, dict) and configuration.get("returnImmediately") is True:
+                task = self._finalize_task_in_background(pending)
+                if task is None:
+                    task = protocol.TaskStore.to_task(self.tasks.get(pending["task_id"]))
+            else:
+                state, reply = self._finalize_task(pending, *self._await_reply(pending))
+                task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
     @staticmethod
@@ -831,20 +898,21 @@ class A2AAdapter(BasePlatformAdapter):
         logger.debug("A2A: push notification sent for task %s", task_id)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
-        """Fulfil the oldest pending reply Future for this context (``chat_id`` = A2A context id).
-        Only sends carrying ``metadata['notify']`` (the base adapter's final-reply marker) satisfy
-        the caller; progress/status/preview sends must not."""
+        """Settle only an explicitly bound final reply, never a context's oldest task.
+
+        The native normal final carries ``_processing_message_id``; inline/queued
+        replies carry their event's explicit ``reply_to`` instead. Unbound
+        notifications must fail visibly without consuming any task reply.
+        """
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
         else:
+            task_id = (metadata or {}).get("_processing_message_id", reply_to)
+            if not task_id:
+                return SendResult(success=False, error="A2A final requires _processing_message_id or an explicit reply_to task ID")
             state = protocol.STATE_FAILED if (metadata or {}).get("processing_error") is not None else protocol.STATE_COMPLETED
-            # The final reply's runner-owned outcome, not error-looking prose, is authoritative.
-            task_id = (metadata or {}).get("_processing_message_id")
-            if task_id:
-                # A bound late/duplicate reply must never fall through to another task.
-                resolved = self._resolve_task(str(task_id), state, content or "")
-            else:
-                resolved = self._resolve_oldest_for_context(chat_id, state, content or "")
+            # An unknown/late bound id must never fall through to another task.
+            resolved = self._resolve_task(str(task_id), state, content or "")
             if not resolved:
                 logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
