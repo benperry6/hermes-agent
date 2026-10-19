@@ -4,6 +4,7 @@ Short tokens (< 18 chars) are fully masked; longer ones keep the first 6 and
 last 4 characters for debuggability.
 """
 
+import ast
 import logging
 import os
 import re
@@ -504,6 +505,8 @@ _AUTH_HEADER_RE = re.compile(r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s
 SECRET_HEADER_NAME_LIST = ("x-api-key", "x-goog-api-key", "api-key", "apikey", "x-api-token", "x-auth-token", "x-access-token")
 _SECRET_HEADER_NAMES = rf"(?:{'|'.join(SECRET_HEADER_NAME_LIST)})"
 _SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNORECASE)
+# Find the value boundary without greedily consuming a later source reference.
+_SECRET_HEADER_START_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(?=\S)", re.IGNORECASE)
 
 # Telegram bot tokens: [bot]<digits>:<token>, token >= 30 chars. The lookbehind
 # anchors the id at the start of its digit run: without it, a long run of digits
@@ -884,6 +887,90 @@ def _redact_phone(m):
     return phone[:keep] + "****" + phone[-keep:]
 
 
+def _source_header_reference_starts(text: str) -> set[int]:
+    """Prove empty Python header literals followed by one Name, never evaluate code.
+
+    Recognition is optional and bounded to the existing native review file size.
+    Larger/invalid/ambiguous source keeps the old masking, not an exemption.
+    Work only on the CURRENT text: prior vault/prefix masks must never be undone.
+    """
+    if len(text) > 128_000:
+        return set()
+    if not any(text[m.end()] in ("'", '"') for m in _SECRET_HEADER_START_RE.finditer(text)):
+        return set()
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return set()
+    # Python's physical lines are CRLF/CR/LF only. str.splitlines also splits
+    # Unicode separators inside comments and would move an AST end onto a secret.
+    # Keep the exact original characters, including every newline sequence.
+    lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", text)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+
+    nodes = list(ast.walk(tree))
+    nested = {id(child) for node in nodes if isinstance(node, ast.BinOp)
+              for child in (node.left, node.right)}
+    endpoints: dict[int, set[int]] = {}
+    for node in nodes:
+        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and id(node) not in nested):
+            continue
+        pending, parts = [node], []
+        while pending:
+            part = pending.pop()
+            if isinstance(part, ast.BinOp) and isinstance(part.op, ast.Add):
+                pending.extend((part.right, part.left))
+            else:
+                parts.append(part)
+        if not (len(parts) in (2, 3) and isinstance(parts[0], ast.Constant)
+                and isinstance(parts[0].value, str) and isinstance(parts[1], ast.Name)):
+            continue
+        header = re.search(rf"{_SECRET_HEADER_NAMES}\s*:\s*$", parts[0].value, re.IGNORECASE)
+        if header is None:
+            continue
+        before = parts[0].value[:header.start()]
+        quote = before[-1:] if before.endswith(("'", '"')) else ""
+        suffix = parts[2] if len(parts) == 3 else ast.Constant(value="")
+        if not (isinstance(suffix, ast.Constant) and isinstance(suffix.value, str)
+                and suffix.value.strip() == quote):
+            continue
+        endpoints.setdefault(parts[0].end_lineno, set()).add(parts[0].end_col_offset)
+    safe = set()
+    for lineno, columns in endpoints.items():
+        # Encode each needed physical line once, then decode disjoint intervals.
+        # Re-encoding the line and decoding its prefix per reference is quadratic.
+        encoded = lines[lineno - 1].encode()
+        byte_column, character_position = 0, offsets[lineno - 1]
+        for column in sorted(columns):
+            character_position += len(encoded[byte_column:column].decode())
+            safe.add(character_position - 1)
+            byte_column = column
+    return safe
+
+
+def _redact_secret_headers(text: str, code_file: bool) -> str:
+    references = _source_header_reference_starts(text) if code_file else set()
+    if not references:
+        return _SECRET_HEADER_RE.sub(lambda m: m.group(1) + _mask_token(m.group(2)), text)
+    parts, cursor = [], 0
+    while header := _SECRET_HEADER_START_RE.search(text, cursor):
+        parts.append(text[cursor:header.start()])
+        if header.end() in references:
+            # Check the proven closing quote BEFORE consuming a greedy suffix.
+            # Resume inside that suffix so later literal headers are still masked.
+            cursor = header.end() + 1
+            parts.append(text[header.start():cursor])
+        else:
+            # Same required prefix and nonspace lookahead guarantee this match.
+            match = _SECRET_HEADER_RE.match(text, header.start())
+            cursor = match.end()
+            parts.append(match.group(1) + _mask_token(match.group(2)))
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False,
                           redact_url_credentials: bool = False) -> str:
@@ -958,7 +1045,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
 
     if ":" in text:
-        text = _SECRET_HEADER_RE.sub(lambda m: m.group(1) + _mask_token(m.group(2)), text)
+        text = _redact_secret_headers(text, code_file)
         text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
 
     if "BEGIN" in text and "-----" in text:
