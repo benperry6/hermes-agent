@@ -169,8 +169,8 @@ def bind_worker_context(frame):
     for key, value in (('HERMES_KANBAN_BRANCH', context['branch']), ('HERMES_TENANT', context['tenant'])):
         if value:
             env[key] = value
-    if context['goal_mode']:
-        env['HERMES_KANBAN_GOAL_MODE'] = '1'
+    # The adopted frame, not a possibly inherited value, owns this worker's mode.
+    env['HERMES_KANBAN_GOAL_MODE'] = '1' if context['goal_mode'] else '0'
     from hermes_cli.kanban_db_dispatch import _worker_terminal_timeout_env
     for key in ('TERMINAL_TIMEOUT', 'TERMINAL_MAX_FOREGROUND_TIMEOUT'):
         value = _worker_terminal_timeout_env(context['max_runtime_seconds'], os.environ.get(key))

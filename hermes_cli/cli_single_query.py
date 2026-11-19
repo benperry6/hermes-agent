@@ -83,6 +83,8 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, 
     def _quiet_turn(prompt: str) -> dict:
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
         _sync_cli_session_id_from_agent(cli)
+        if isinstance(result, dict) and result.get("messages"):
+            cli.conversation_history = result["messages"]
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
@@ -314,6 +316,8 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # authority this process can no longer prove (round-3 finding).
     if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _exit_code == 0:
         try:
+            if isinstance(result, dict) and result.get("messages"):
+                cli.conversation_history = result["messages"]
             _run_kanban_goal_loop_q(cli, response)
         except Exception as _goal_exc:
             logger.debug("kanban goal loop failed: %s", _goal_exc)
