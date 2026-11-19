@@ -257,7 +257,16 @@ def _session_db_content_sig(db_path: Path):
 
         conn = _connect_tracked_db(read_only_db_uri(db_path), tracking_path=db_path,
                                    uri=True, timeout=0.05)
-        signature = _session_list_revision(conn) or _session_rows_digest(conn, mtime)
+        # Read the cookie and revision in one snapshot. SQLite's backup API
+        # increments the destination schema cookie even for an in-place restore
+        # with the same list revision. Normal row writes leave it unchanged.
+        conn.execute("BEGIN")
+        revision = _session_list_revision(conn)
+        if revision is None:
+            signature = _session_rows_digest(conn, mtime)
+        else:
+            cookie = conn.execute("PRAGMA main.schema_version").fetchone()[0]
+            signature = (*revision, cookie)
     except Exception:
         # A busy/locked read after a good one keeps the last digest and leaves the cached mtime
         # stale so the next pass re-reads: digest -> mtime -> digest would broadcast twice.
