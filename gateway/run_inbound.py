@@ -1326,12 +1326,18 @@ class GatewayInboundMixin(
             # A pinned adapter-FIFO turn (a /goal continuation) runs only in the session it was
             # judged in. The native envelope keeps no gateway metadata, so the pin is spent here.
             pinned = event.metadata.pop("gateway_session_id", None)
+            generation = event.metadata.pop("goal_created_at", None)
             for key in ("gateway_session_key", "gateway_session_strict"):
                 event.metadata.pop(key, None)
             entry = await self.async_session_store.lookup_by_session_key(_quick_key)
             if entry is None or not pinned or entry.session_id != pinned:
                 logger.warning("Dropping pinned FIFO turn: session id=%s is no longer current for key=%s",
                                pinned or "missing", _quick_key)
+                return True, None
+            # Committed as the wake a turn without a drainer queues, not as a plain row: a /goal pause,
+            # clear or new goal while it waits behind a follow-up still stops it, and the follow-up's
+            # judgment sees it waiting.
+            if generation is not None and await self._admit_goal_continuation(source, event.text, pinned, generation):
                 return True, None
         # The durable FIFO only orders turns; busy_input_mode still decides what a follow-up
         # does to the RUNNING one (steer into it, redirect it, or end it so the FIFO advances).
